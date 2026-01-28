@@ -6,9 +6,7 @@ def _ts() -> int:
     return int(time.time())
 
 
-# 5 часов вперёд: 5ч / 5мин = 60 тиков
-# Мы будем отдавать данные "по тик-индексу" (time bucket), чтобы оно выглядело как живое.
-# Внутри каждого сценария есть 60 шагов.
+# 5 часов вперёд: 60 тиков (каждые 5 минут)
 PREBAKED_TIMELINE: Dict[str, List[Dict[str, Any]]] = {
     "neutral": [
         {
@@ -61,24 +59,12 @@ PREBAKED_TIMELINE: Dict[str, List[Dict[str, Any]]] = {
 }
 
 
-def choose_scenario() -> str:
-    """
-    Пока фиксируем на neutral.
-    На следующем шаге добавим автоматический выбор сценария по расписанию или ручному переключателю через KV.
-    """
-    return "neutral"
+def get_prebaked_snapshot(scenario: str) -> Dict[str, Any]:
+    bucket = int(_ts() / 300)  # 5 минут
+    idx = bucket % 60
 
-
-def get_prebaked_snapshot() -> Dict[str, Any]:
-    """
-    Возвращает "снимок" данных на текущий тик (каждые 5 минут).
-    Вычисляем индекс по времени, чтобы данные выглядели как "живые" и не скакали от рефреша.
-    """
-    scenario = choose_scenario()
-
-    # bucket: 5 минут
-    bucket = int(_ts() / 300)
-    idx = bucket % 60  # 60 тиков = 5 часов
+    if scenario not in PREBAKED_TIMELINE:
+        scenario = "neutral"
 
     row = PREBAKED_TIMELINE[scenario][idx].copy()
     row["ts"] = _ts()
