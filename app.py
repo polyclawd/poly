@@ -6,6 +6,8 @@ from typing import Optional, Literal, List, Dict, Any
 import httpx
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
+from urllib.parse import quote
 
 from prebaked_data import get_prebaked_snapshot
 
@@ -18,12 +20,10 @@ KV_REST_API_URL = os.getenv("KV_REST_API_URL", "https://thankful-bluegill-32910.
 KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "AYCOAAIncDI5OTM2N2MzOTBiNGE0NzJjODhjZTZjZWQzNzBjMDI5MXAyMzI5MTA")
 
 LOCK_KEY = os.getenv("EXECUTOR_LOCK_KEY", "executor:lock")
-
-# Scenario stored in KV
 SCENARIO_KEY = os.getenv("SCENARIO_KEY", "public:scenario")
 
 # ============================
-# Auth (Swagger "Authorize")
+# Auth
 # ============================
 bearer = HTTPBearer(auto_error=False)
 
@@ -48,8 +48,16 @@ def _headers():
     return {"Authorization": f"Bearer {KV_REST_API_TOKEN}", "Accept": "application/json"}
 
 
+def _enc(s: str) -> str:
+    # Upstash REST uses key/value inside URL path, so we must URL-encode safely
+    return quote(s, safe="")
+
+
 async def kv_get(key: str) -> Optional[str]:
-    url = f"{KV_REST_API_URL}/get/{key}"
+    if not KV_REST_API_URL or not KV_REST_API_TOKEN:
+        return None
+
+    url = f"{KV_REST_API_URL}/get/{_enc(key)}"
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(url, headers=_headers())
     r.raise_for_status()
@@ -57,15 +65,21 @@ async def kv_get(key: str) -> Optional[str]:
 
 
 async def kv_set(key: str, value: str) -> bool:
-    url = f"{KV_REST_API_URL}/set/{key}/{value}"
+    if not KV_REST_API_URL or not KV_REST_API_TOKEN:
+        return False
+
+    url = f"{KV_REST_API_URL}/set/{_enc(key)}/{_enc(value)}"
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(url, headers=_headers())
     return r.status_code == 200
 
 
 async def try_lock() -> Optional[str]:
+    if not KV_REST_API_URL or not KV_REST_API_TOKEN:
+        raise HTTPException(status_code=500, detail="KV not configured")
+
     lock_id = str(uuid.uuid4())
-    url = f"{KV_REST_API_URL}/setnx/{LOCK_KEY}/{lock_id}"
+    url = f"{KV_REST_API_URL}/setnx/{_enc(LOCK_KEY)}/{_enc(lock_id)}"
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(url, headers=_headers())
     if r.status_code == 200 and r.json().get("result") == 1:
@@ -74,13 +88,15 @@ async def try_lock() -> Optional[str]:
 
 
 async def unlock() -> None:
-    url = f"{KV_REST_API_URL}/del/{LOCK_KEY}"
+    if not KV_REST_API_URL or not KV_REST_API_TOKEN:
+        return
+    url = f"{KV_REST_API_URL}/del/{_enc(LOCK_KEY)}"
     async with httpx.AsyncClient(timeout=10) as client:
         await client.post(url, headers=_headers())
 
 
 # ============================
-# Agents (with weights + disagreements)
+# Agents (weighted + disagreements + veto)
 # ============================
 Signal = Literal["BUY", "SELL", "HOLD"]
 
@@ -102,25 +118,23 @@ AGENTS: List[Dict[str, Any]] = [
     {"id": "A15", "role": "Final Reviewer", "weight": 1.0},
 ]
 
-# Blockers: if these agents say HOLD/SELL with high confidence, they can veto BUY
 BLOCKER_IDS = {"A05", "A12", "A13", "A14"}
 
-# Deterministic "personality" offsets (so they disagree in a stable way)
 PERSONALITY = {
     "A01": 0.00,
     "A02": -0.05,
     "A03": 0.03,
     "A04": 0.04,
-    "A05": -0.06,  # more conservative
+    "A05": -0.06,
     "A06": -0.02,
-    "A07": -0.08,  # contrarian more likely to oppose
+    "A07": -0.08,
     "A08": 0.05,
     "A09": -0.04,
     "A10": -0.03,
     "A11": -0.01,
-    "A12": -0.07,  # sizing conservative
-    "A13": -0.06,  # safety conservative
-    "A14": -0.05,  # guardrails conservative
+    "A12": -0.07,
+    "A13": -0.06,
+    "A14": -0.05,
     "A15": 0.00,
 }
 
@@ -130,14 +144,10 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def _agent_decide(agent: Dict[str, Any], snap: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Scenario gives a base direction, but each agent has a stable personality offset.
-    Also low edge -> HOLD more often.
-    """
     scenario = snap.get("scenario", "neutral")
     price = float(snap.get("market_price", 0.5) or 0.5)
     fv = float(snap.get("fair_value", 0.5) or 0.5)
-    edge = fv - price  # positive edge => buy bias
+    edge = fv - price
 
     base = 0.0
     if scenario == "bull":
@@ -147,11 +157,8 @@ def _agent_decide(agent: Dict[str, Any], snap: Dict[str, Any]) -> Dict[str, Any]
 
     pid = agent["id"]
     bias = base + PERSONALITY.get(pid, 0.0)
-
-    # incorporate edge
     bias += _clamp(edge, -0.08, 0.08)
 
-    # decide signal
     if bias >= 0.06:
         signal: Signal = "BUY"
     elif bias <= -0.06:
@@ -159,10 +166,7 @@ def _agent_decide(agent: Dict[str, Any], snap: Dict[str, Any]) -> Dict[str, Any]
     else:
         signal = "HOLD"
 
-    # confidence scales with |bias|
     conf = _clamp(0.5 + abs(bias) * 2.2, 0.45, 0.92)
-
-    # conservative agents reduce confidence a bit
     if pid in BLOCKER_IDS:
         conf = _clamp(conf - 0.05, 0.45, 0.92)
 
@@ -197,10 +201,6 @@ def _agent_decide(agent: Dict[str, Any], snap: Dict[str, Any]) -> Dict[str, Any]
 
 
 def _aggregate(agents_out: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Weighted vote with blocker veto.
-    BUY=+1, HOLD=0, SELL=-1.
-    """
     wsum = 0.0
     score = 0.0
     conf_sum = 0.0
@@ -224,15 +224,13 @@ def _aggregate(agents_out: List[Dict[str, Any]]) -> Dict[str, Any]:
 
         score += w * v * c
 
-        # veto logic: conservative agents can block BUY if they're strongly against
         if a["agent_id"] in BLOCKER_IDS and s != "BUY" and c >= 0.70:
             veto_buy = True
-            veto_reasons.append(f"{a['agent_id']}({a['role']}) blocks BUY: {s} conf={c}")
+            veto_reasons.append(f"{a['agent_id']} blocks BUY: {s} conf={c}")
 
     avg_conf = conf_sum / max(len(agents_out), 1)
     norm_score = score / max(wsum, 1e-9)
 
-    # base decision from score
     if norm_score >= 0.25:
         decision: Signal = "BUY"
     elif norm_score <= -0.25:
@@ -240,7 +238,6 @@ def _aggregate(agents_out: List[Dict[str, Any]]) -> Dict[str, Any]:
     else:
         decision = "HOLD"
 
-    # apply veto
     if decision == "BUY" and veto_buy:
         decision = "HOLD"
 
@@ -254,14 +251,19 @@ def _aggregate(agents_out: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ============================
+# Scenario API model (Swagger dropdown!)
+# ============================
+Scenario = Literal["neutral", "bull", "bear"]
+
+
+class ScenarioBody(BaseModel):
+    scenario: Scenario
+
+
+# ============================
 # App
 # ============================
-app = FastAPI(title="Polyclawd Executor", version="0.5.0")
-
-
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "executor", "docs": "/docs", "health": "/healthz"}
+app = FastAPI(title="Polyclawd Executor", version="0.6.0")
 
 
 @app.get("/healthz")
@@ -271,14 +273,14 @@ async def healthz():
 
 @app.get("/scenario")
 async def scenario_get(_: bool = Depends(require_auth)):
-    s = await kv_get(SCENARIO_KEY)
-    return {"ok": True, "scenario": s or "neutral"}
+    current = (await kv_get(SCENARIO_KEY)) or "neutral"
+    return {"ok": True, "scenario": current, "key": SCENARIO_KEY}
 
 
-@app.post("/scenario/{value}")
-async def scenario_set(value: Literal["neutral", "bull", "bear"], _: bool = Depends(require_auth)):
-    ok = await kv_set(SCENARIO_KEY, value)
-    return {"ok": ok, "scenario": value}
+@app.post("/scenario")
+async def scenario_set(body: ScenarioBody, _: bool = Depends(require_auth)):
+    ok = await kv_set(SCENARIO_KEY, body.scenario)
+    return {"ok": ok, "scenario": body.scenario, "key": SCENARIO_KEY}
 
 
 @app.post("/run")
@@ -305,6 +307,7 @@ async def run(_: bool = Depends(require_auth)):
             "ts": snap.get("ts"),
             "tick_index": snap.get("tick_index"),
             "scenario": scenario,
+            "scenario_key": SCENARIO_KEY,
             "position": snap.get("position"),
             "market_price": snap.get("market_price"),
             "fair_value": snap.get("fair_value"),
