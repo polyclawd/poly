@@ -7,6 +7,8 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from prebaked_data import get_prebaked_snapshot
+
 # ============================
 # Config (ENV ONLY)
 # ============================
@@ -14,11 +16,8 @@ EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "")
 
 KV_REST_API_URL = os.getenv("KV_REST_API_URL", "").rstrip("/")
 KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "")
-KV_REST_API_READ_ONLY_TOKEN = os.getenv("KV_REST_API_READ_ONLY_TOKEN", "")
 
 LOCK_KEY = os.getenv("EXECUTOR_LOCK_KEY", "executor:lock")
-LOCK_TTL_SECONDS = int(os.getenv("EXECUTOR_LOCK_TTL_SECONDS", "60"))
-RUN_TIMEOUT_SECONDS = float(os.getenv("EXECUTOR_RUN_TIMEOUT_SECONDS", "25"))
 
 # ============================
 # Auth (Swagger "Authorize")
@@ -41,7 +40,7 @@ def require_auth(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> bool:
 
 
 # ============================
-# Upstash REST helpers
+# Upstash REST helpers (lock only)
 # ============================
 def _upstash_headers(token: str) -> dict:
     return {
@@ -74,9 +73,6 @@ async def upstash_del(key: str, token: str) -> int:
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.post(url, headers=_upstash_headers(token))
 
-    if r.status_code == 401:
-        return 0
-
     r.raise_for_status()
     data = r.json()
     return int(data.get("result", 0))
@@ -91,12 +87,11 @@ async def try_lock() -> Optional[str]:
 
 
 async def unlock(lock_id: str) -> None:
-    # упрощенный unlock
     await upstash_del(LOCK_KEY, KV_REST_API_TOKEN)
 
 
 # ============================
-# Fake agents (prebaked)
+# Fake agents
 # ============================
 Signal = Literal["BUY", "SELL", "HOLD"]
 
@@ -119,31 +114,8 @@ AGENTS: List[Dict[str, str]] = [
 ]
 
 
-def _load_prebaked() -> Dict[str, Any]:
-    """
-    На следующем шаге мы вынесем это в отдельный файл prebaked_data.py.
-    Пока держим дефолт прямо тут, чтобы всё работало сразу.
-    """
-    return {
-        "scenario": "neutral",
-        "position": "example-market-123",
-        "market_price": 0.52,
-        "fair_value": 0.52,
-        "news": [
-            {"title": "No major updates", "snippet": "Quiet market conditions", "score": 0.50},
-        ],
-        "social": [
-            {"title": "Neutral sentiment", "snippet": "Mixed opinions", "score": 0.50},
-        ],
-    }
-
-
-def _agent_decide(agent: Dict[str, str], data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Фейковая логика: агент читает "scenario" и выдаёт сигнал.
-    Мы специально делаем просто, чтобы быстро запустить 15 агентов.
-    """
-    scenario = data.get("scenario", "neutral")
+def _agent_decide(agent: Dict[str, str], snap: Dict[str, Any]) -> Dict[str, Any]:
+    scenario = snap.get("scenario", "neutral")
 
     if scenario == "bull":
         signal: Signal = "BUY"
@@ -155,14 +127,20 @@ def _agent_decide(agent: Dict[str, str], data: Dict[str, Any]) -> Dict[str, Any]
         signal = "HOLD"
         conf = 0.55
 
-    notes = [f"prebaked scenario={scenario}"]
-    evidence_items = []
+    notes = [
+        f"scenario={scenario}",
+        f"market_price={snap.get('market_price')}",
+        f"fair_value={snap.get('fair_value')}",
+        snap.get("headline", ""),
+    ]
 
-    for item in (data.get("news", [])[:1] + data.get("social", [])[:1]):
+    evidence_items = []
+    for item in (snap.get("news", [])[:1] + snap.get("social", [])[:1]):
         evidence_items.append(
             {
                 "title": item.get("title", "evidence"),
                 "snippet": item.get("snippet", ""),
+                "url": item.get("url"),
                 "score": float(item.get("score", 0.5)),
             }
         )
@@ -173,18 +151,11 @@ def _agent_decide(agent: Dict[str, str], data: Dict[str, Any]) -> Dict[str, Any]
         "signal": signal,
         "confidence": round(conf, 3),
         "notes": notes,
-        "evidence": {
-            "source": "prebaked",
-            "items": evidence_items,
-        },
+        "evidence": {"source": "prebaked", "items": evidence_items},
     }
 
 
 def _aggregate(agents_out: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Взвешенное голосование: BUY=+1, HOLD=0, SELL=-1,
-    умножаем на confidence.
-    """
     score = 0.0
     conf_sum = 0.0
 
@@ -200,7 +171,6 @@ def _aggregate(agents_out: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     avg_conf = (conf_sum / max(len(agents_out), 1)) if agents_out else 0.0
 
-    # пороги можно потом тюнить
     if score >= 2.5:
         decision: Signal = "BUY"
     elif score <= -2.5:
@@ -208,27 +178,18 @@ def _aggregate(agents_out: List[Dict[str, Any]]) -> Dict[str, Any]:
     else:
         decision = "HOLD"
 
-    return {
-        "decision": decision,
-        "score": round(score, 3),
-        "avg_conf": round(avg_conf, 3),
-    }
+    return {"decision": decision, "score": round(score, 3), "avg_conf": round(avg_conf, 3)}
 
 
 # ============================
 # App
 # ============================
-app = FastAPI(title="Polyclawd Executor", version="0.2.0")
+app = FastAPI(title="Polyclawd Executor", version="0.3.0")
 
 
 @app.get("/")
 async def root():
-    return {
-        "ok": True,
-        "service": "executor",
-        "docs": "/docs",
-        "health": "/healthz",
-    }
+    return {"ok": True, "service": "executor", "docs": "/docs", "health": "/healthz"}
 
 
 @app.get("/healthz")
@@ -244,28 +205,16 @@ async def healthz():
 
 @app.post("/run")
 async def run(_: bool = Depends(require_auth)):
-    """
-    Запускается GitHub Actions cron-ом.
-    Требует: Authorization: Bearer <EXECUTOR_SECRET>
-    """
     started = time.time()
 
     lock_id = await try_lock()
     if not lock_id:
-        return {
-            "ok": True,
-            "skipped": True,
-            "reason": "locked",
-            "message": "Another executor run is in progress",
-        }
+        return {"ok": True, "skipped": True, "reason": "locked", "message": "Another executor run is in progress"}
 
     try:
-        prebaked = _load_prebaked()
+        snap = get_prebaked_snapshot()
 
-        # 15 агентов
-        agents_out = [_agent_decide(agent, prebaked) for agent in AGENTS]
-
-        # агрегируем
+        agents_out = [_agent_decide(agent, snap) for agent in AGENTS]
         agg = _aggregate(agents_out)
 
         duration = round(time.time() - started, 3)
@@ -274,17 +223,18 @@ async def run(_: bool = Depends(require_auth)):
             "ok": True,
             "skipped": False,
             "message": "tick executed",
-            "scenario": prebaked.get("scenario", "neutral"),
-            "position": prebaked.get("position"),
+            "ts": snap.get("ts"),
+            "tick_index": snap.get("tick_index"),
+            "scenario": snap.get("scenario"),
+            "position": snap.get("position"),
+            "market_price": snap.get("market_price"),
+            "fair_value": snap.get("fair_value"),
             "decision": agg["decision"],
             "score": agg["score"],
             "avg_conf": agg["avg_conf"],
             "agents": agents_out,
             "duration_sec": duration,
         }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Executor error: {type(e).__name__}: {e}") from e
 
     finally:
         try:
