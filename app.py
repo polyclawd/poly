@@ -1,206 +1,189 @@
 import os
 import time
-from typing import Any, Dict, List, Optional
+import uuid
+from typing import Optional
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
-UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
-EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET")
-SITE_BASE_URL = os.getenv("SITE_BASE_URL")  # e.g. https://your-vercel-site.vercel.app
+app = FastAPI(title="PolyClawd Executor", version="0.1.0")
 
+# --- Auth (this makes Swagger show the 🔒 Authorize button) ---
+bearer_scheme = HTTPBearer(auto_error=True)
+
+
+def _env(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
+        raise RuntimeError(f"Missing env var: {name}")
+    return val
+
+
+KV_REST_API_URL = os.getenv("KV_REST_API_URL", "https://thankful-bluegill-32910.upstash.io").rstrip("/")
+KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "AYCOAAIncDI5OTM2N2MzOTBiNGE0NzJjODhjZTZjZWQzNzBjMDI5MXAyMzI5MTA")
+KV_REST_API_READ_ONLY_TOKEN = os.getenv("KV_REST_API_READ_ONLY_TOKEN", "AoCOAAIgcDLO-2qllWynMs01ogYqMD8JqSY3FvxGj_ywnYHKeHFZxg")
+
+EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "executor-secret-polyclawd-2026")
+
+# Keys used in KV
 LOCK_KEY = "executor:lock"
-LOCK_TTL_SECONDS = 60
-
-app = FastAPI()
+LAST_RUN_KEY = "executor:last_run"
 
 
-def _auth_or_401(authorization: Optional[str]):
-    if not EXECUTOR_SECRET:
-        raise HTTPException(500, "EXECUTOR_SECRET missing on executor")
-    if authorization != f"Bearer {EXECUTOR_SECRET}":
-        raise HTTPException(401, "Unauthorized")
+def _kv_headers(read_only: bool = False) -> dict:
+    token = KV_REST_API_READ_ONLY_TOKEN if read_only and KV_REST_API_READ_ONLY_TOKEN else KV_REST_API_TOKEN
+    if not token:
+        raise RuntimeError("Missing KV token (KV_REST_API_TOKEN or KV_REST_API_READ_ONLY_TOKEN)")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
 
 
-async def kv_get(key: str) -> Any:
-    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
-        raise HTTPException(500, "Upstash env missing on executor")
-    url = f"{UPSTASH_REDIS_REST_URL}/get/{key}"
-    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, headers=headers)
+async def kv_get(key: str) -> Optional[str]:
+    if not KV_REST_API_URL:
+        raise RuntimeError("Missing KV_REST_API_URL")
+    url = f"{KV_REST_API_URL}/get/{key}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, headers=_kv_headers(read_only=True))
         r.raise_for_status()
         data = r.json()
+        # Upstash typically returns {"result": "..."} or {"result": None}
         return data.get("result")
 
 
-async def kv_set(key: str, value: Any) -> None:
-    url = f"{UPSTASH_REDIS_REST_URL}/set/{key}"
-    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(url, headers=headers, json=value)
+async def kv_set(key: str, value: str) -> None:
+    if not KV_REST_API_URL:
+        raise RuntimeError("Missing KV_REST_API_URL")
+    url = f"{KV_REST_API_URL}/set/{key}/{value}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=_kv_headers(read_only=False))
         r.raise_for_status()
 
 
-async def kv_set_ex(key: str, ttl_seconds: int, value: Any) -> None:
-    url = f"{UPSTASH_REDIS_REST_URL}/setex/{key}/{ttl_seconds}"
-    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(url, headers=headers, json=value)
+async def kv_setnx(key: str, value: str) -> bool:
+    """
+    Atomic lock acquire using Upstash SETNX.
+    """
+    if not KV_REST_API_URL:
+        raise RuntimeError("Missing KV_REST_API_URL")
+    url = f"{KV_REST_API_URL}/setnx/{key}/{value}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=_kv_headers(read_only=False))
+        r.raise_for_status()
+        data = r.json()
+        # Upstash returns {"result": 1} if set, {"result": 0} if not set
+        return bool(data.get("result"))
+
+
+async def kv_del(key: str) -> None:
+    if not KV_REST_API_URL:
+        raise RuntimeError("Missing KV_REST_API_URL")
+    url = f"{KV_REST_API_URL}/del/{key}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=_kv_headers(read_only=False))
         r.raise_for_status()
 
 
-async def try_lock() -> bool:
+async def try_lock(ttl_seconds: int = 60) -> bool:
     """
-    Poor-man distributed lock using SETNX + EX.
-    Upstash REST supports SETNX via /setnx/<key>.
-    If not available in your plan, we can emulate later.
+    We implement a simple lock:
+    - lock value is "<uuid>:<expires_at_epoch>"
+    - acquire with SETNX
+    - if lock exists and expired -> delete and retry once
     """
-    url = f"{UPSTASH_REDIS_REST_URL}/setnx/{LOCK_KEY}"
-    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(url, headers=headers, json=str(int(time.time())))
-        r.raise_for_status()
-        ok = bool(r.json().get("result"))
-        if ok:
-            # set ttl
-            await kv_set_ex(LOCK_KEY, LOCK_TTL_SECONDS, "1")
-        return ok
+    now = int(time.time())
+    lock_id = str(uuid.uuid4())
+    expires_at = now + ttl_seconds
+    value = f"{lock_id}:{expires_at}"
 
+    acquired = await kv_setnx(LOCK_KEY, value)
+    if acquired:
+        return True
 
-async def release_lock() -> None:
-    url = f"{UPSTASH_REDIS_REST_URL}/del/{LOCK_KEY}"
-    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        await client.post(url, headers=headers)
-
-
-async def post_executor_status(last_result: str, message: str):
-    """
-    Update the site so UI shows executor status.
-    """
-    if not SITE_BASE_URL:
-        return
-    url = f"{SITE_BASE_URL}/api/executor/status"
-    headers = {"Authorization": f"Bearer {EXECUTOR_SECRET}"}
-    payload = {
-        "lastRunAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "lastResult": last_result,
-        "message": message[:200],
-    }
-    async with httpx.AsyncClient(timeout=20) as client:
-        try:
-            await client.post(url, headers=headers, json=payload)
-        except Exception:
-            # don't crash run just because UI status update failed
-            pass
-
-
-def now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-async def append_agent_event(agent_id: int, event: Dict[str, Any], limit: int = 50):
-    key = f"replay:agent:{agent_id}:events"
-    existing = await kv_get(key) or []
-    if not isinstance(existing, list):
-        existing = []
-    existing.append(event)
-    existing = existing[-limit:]
-    await kv_set(key, existing)
-
-
-async def load_agents() -> List[Dict[str, Any]]:
-    agents = await kv_get("replay:agents") or []
-    return agents if isinstance(agents, list) else []
-
-
-async def save_agents(agents: List[Dict[str, Any]]):
-    await kv_set("replay:agents", agents)
-
-
-async def load_state() -> Dict[str, Any]:
-    state = await kv_get("replay:state") or {}
-    return state if isinstance(state, dict) else {}
-
-
-async def load_agent_market(agent_id: int) -> Optional[Dict[str, Any]]:
-    m = await kv_get(f"pm:agent:{agent_id}:market")
-    return m if isinstance(m, dict) else None
-
-
-class RunResponse(BaseModel):
-    ok: bool
-    result: str
-    message: str
-
-
-@app.post("/run", response_model=RunResponse)
-async def run(authorization: Optional[str] = Header(default=None)):
-    _auth_or_401(authorization)
-
-    locked = await try_lock()
-    if not locked:
-        await post_executor_status("skipped", "Lock active: previous run still in progress")
-        return RunResponse(ok=True, result="skipped", message="Lock active, skipping")
+    existing = await kv_get(LOCK_KEY)
+    if not existing:
+        return False
 
     try:
-        state = await load_state()
-        trade_mode = state.get("tradeMode", "PAPER")
-        kill = bool(state.get("killSwitch", True))
+        _lock_id, exp_str = existing.split(":", 1)
+        exp = int(exp_str)
+    except Exception:
+        # malformed lock -> clear it
+        await kv_del(LOCK_KEY)
+        return await kv_setnx(LOCK_KEY, value)
 
-        if kill:
-            await post_executor_status("skipped", "Kill switch enabled")
-            return RunResponse(ok=True, result="skipped", message="Kill switch enabled")
+    if exp <= now:
+        # expired -> clear and retry once
+        await kv_del(LOCK_KEY)
+        return await kv_setnx(LOCK_KEY, value)
 
-        # DRY RUN only in this step — do not place real orders yet
-        agents = await load_agents()
-        if not agents:
-            await post_executor_status("error", "No agents in KV")
-            return RunResponse(ok=False, result="error", message="No agents in KV")
+    return False
 
-        for a in agents:
-            agent_id = int(a["id"])
-            market = await load_agent_market(agent_id)
-            question = (market or {}).get("question") or a.get("marketTitle") or f"Agent {agent_id}"
 
-            # example: generate a fake action now, replace with real strategy later
-            action = "HOLD"
-            size_usd = 0
+async def unlock() -> None:
+    # best-effort unlock
+    try:
+        await kv_del(LOCK_KEY)
+    except Exception:
+        pass
 
-            # you can make it deterministic per agent to look stable
-            if agent_id % 3 == 0:
-                action = "BUY"
-                size_usd = 10
-            elif agent_id % 5 == 0:
-                action = "SELL"
-                size_usd = 10
 
-            msg = f"[DRY RUN] {action} {a.get('outcome','YES')} ${size_usd} on '{question}' (mode={trade_mode})"
-            await append_agent_event(agent_id, {
-                "id": f"live-{agent_id}-{int(time.time())}",
-                "agentId": agent_id,
-                "ts": now_iso(),
-                "type": "info",
-                "message": msg
-            })
-
-            # update agent status so UI shows activity
-            a["status"] = "active" if action != "HOLD" else "idle"
-            a["lastRunAt"] = now_iso()
-
-        await save_agents(agents)
-        await post_executor_status("ok", f"Ran DRY cycle for {len(agents)} agents")
-        return RunResponse(ok=True, result="ok", message="Dry run cycle executed")
-    except Exception as e:
-        await post_executor_status("error", str(e))
-        raise
-    finally:
-        await release_lock()
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "executor", "docs": "/docs"}
 
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True}
+    """
+    Health check endpoint. Also useful to verify KV connectivity.
+    """
+    status = {"ok": True}
+    # If KV configured, try a cheap read to confirm auth works.
+    if KV_REST_API_URL and (KV_REST_API_TOKEN or KV_REST_API_READ_ONLY_TOKEN):
+        try:
+            _ = await kv_get(LAST_RUN_KEY)
+            status["kv"] = "ok"
+        except Exception as e:
+            status["kv"] = f"error: {type(e).__name__}"
+    else:
+        status["kv"] = "not_configured"
+    return status
+
+
+@app.post("/run")
+async def run(creds: HTTPAuthorizationCredentials = Security(bearer_scheme)):
+    """
+    Protected endpoint:
+    Header must be: Authorization: Bearer <EXECUTOR_SECRET>
+    """
+    if not EXECUTOR_SECRET:
+        raise HTTPException(status_code=500, detail="Server missing EXECUTOR_SECRET")
+
+    token = creds.credentials  # <-- already stripped from "Bearer "
+    if token != EXECUTOR_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Acquire lock to avoid overlapping runs
+    try:
+        locked = await try_lock(ttl_seconds=90)
+    except httpx.HTTPStatusError as e:
+        # Most common: 401 from Upstash because token/url mismatch
+        raise HTTPException(status_code=500, detail=f"KV error: {e.response.status_code} {e.response.text}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"KV error: {type(e).__name__}: {e}")
+
+    if not locked:
+        return {"ok": True, "message": "Already running (lock held). Skipping tick."}
+
+    try:
+        # ---- PLACE YOUR REAL EXECUTION LOGIC HERE ----
+        # For now we just write last_run timestamp to KV.
+        ts = str(int(time.time()))
+        await kv_set(LAST_RUN_KEY, ts)
+
+        return {"ok": True, "message": "Tick executed", "last_run": ts}
+    finally:
+        await unlock()
