@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 import random
+import json
 from typing import Optional, Dict, Any, List
 
 import httpx
@@ -17,16 +18,20 @@ EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "executor-secret-polyclawd-2026")
 
 KV_REST_API_URL = os.getenv("KV_REST_API_URL", "https://thankful-bluegill-32910.upstash.io").rstrip("/")
 KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "AYCOAAIncDI5OTM2N2MzOTBiNGE0NzJjODhjZTZjZWQzNzBjMDI5MXAyMzI5MTA")
-KV_REST_API_READ_ONLY_TOKEN = os.getenv("KV_REST_API_READ_ONLY_TOKEN", "")  # optional
+KV_REST_API_READ_ONLY_TOKEN = os.getenv("KV_REST_API_READ_ONLY_TOKEN", "") or KV_REST_API_TOKEN
 
 LOCK_KEY = os.getenv("EXECUTOR_LOCK_KEY", "executor:lock")
 SCENARIO_KEY = os.getenv("EXECUTOR_SCENARIO_KEY", "executor:scenario")
 
+# где хранить последний расчёт для сайта
+PUBLIC_LATEST_KEY = os.getenv("PUBLIC_LATEST_KEY", "public:latest")
+
 LOCK_TTL_SECONDS = int(os.getenv("EXECUTOR_LOCK_TTL_SECONDS", "60"))
 RUN_TIMEOUT_SECONDS = float(os.getenv("EXECUTOR_RUN_TIMEOUT_SECONDS", "25"))
 
-# "конкретная позиция" (пока фейк) — позже заменим на реальную
 POSITION_ID = os.getenv("POSITION_ID", "POLYMARKET:DEMO_POSITION_001")
+
+ALLOWED_SCENARIOS = {"bull", "neutral", "bear"}
 
 
 # ============================================================
@@ -56,9 +61,23 @@ def _upstash_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 
+async def _upstash_get(path: str, token: str) -> Dict[str, Any]:
+    if not KV_REST_API_URL or not token:
+        raise HTTPException(status_code=500, detail="KV misconfigured: KV_REST_API_URL / token missing")
+
+    url = f"{KV_REST_API_URL}/{path.lstrip('/')}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(url, headers=_upstash_headers(token))
+
+    if r.status_code == 401:
+        raise HTTPException(status_code=500, detail="Upstash 401 Unauthorized: check KV_REST_API_TOKEN")
+    r.raise_for_status()
+    return r.json()
+
+
 async def _upstash_post(path: str, token: str) -> Dict[str, Any]:
     if not KV_REST_API_URL or not token:
-        raise HTTPException(status_code=500, detail="Server misconfigured: KV_REST_API_URL / KV_REST_API_TOKEN missing")
+        raise HTTPException(status_code=500, detail="KV misconfigured: KV_REST_API_URL / token missing")
 
     url = f"{KV_REST_API_URL}/{path.lstrip('/')}"
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -66,36 +85,29 @@ async def _upstash_post(path: str, token: str) -> Dict[str, Any]:
 
     if r.status_code == 401:
         raise HTTPException(status_code=500, detail="Upstash 401 Unauthorized: check KV_REST_API_TOKEN")
-
     r.raise_for_status()
     return r.json()
 
 
-async def upstash_set(key: str, value: str, token: str) -> bool:
-    # Upstash REST: SET key value
+async def kv_set(key: str, value: str, token: str) -> bool:
     data = await _upstash_post(f"set/{key}/{value}", token)
-    # usually: {"result":"OK"}
     return str(data.get("result", "")).upper() == "OK"
 
 
-async def upstash_get(key: str, token: str) -> Optional[str]:
-    # Upstash REST: GET key
-    data = await _upstash_post(f"get/{key}", token)
-    # usually: {"result": "value"} or {"result": null}
+async def kv_get(key: str, token: str) -> Optional[str]:
+    data = await _upstash_get(f"get/{key}", token)
     v = data.get("result", None)
     if v is None:
         return None
     return str(v)
 
 
-async def upstash_setnx(key: str, value: str, token: str) -> int:
-    # Upstash REST: SETNX key value
+async def kv_setnx(key: str, value: str, token: str) -> int:
     data = await _upstash_post(f"setnx/{key}/{value}", token)
     return int(data.get("result", 0))
 
 
-async def upstash_del(key: str, token: str) -> int:
-    # Upstash REST: DEL key
+async def kv_del(key: str, token: str) -> int:
     try:
         data = await _upstash_post(f"del/{key}", token)
         return int(data.get("result", 0))
@@ -105,42 +117,33 @@ async def upstash_del(key: str, token: str) -> int:
 
 async def try_lock() -> Optional[str]:
     lock_id = str(uuid.uuid4())
-    ok = await upstash_setnx(LOCK_KEY, lock_id, KV_REST_API_TOKEN)
-    if ok == 1:
-        return lock_id
-    return None
+    ok = await kv_setnx(LOCK_KEY, lock_id, KV_REST_API_TOKEN)
+    return lock_id if ok == 1 else None
 
 
 async def unlock(_: str) -> None:
-    await upstash_del(LOCK_KEY, KV_REST_API_TOKEN)
+    await kv_del(LOCK_KEY, KV_REST_API_TOKEN)
 
 
 # ============================================================
 # Scenario storage
 # ============================================================
-ALLOWED_SCENARIOS = {"bull", "neutral", "bear"}
-
-
 async def get_scenario() -> str:
-    # если KV не настроен — живём дефолтом
     if not KV_REST_API_URL or not KV_REST_API_TOKEN:
         return "neutral"
 
-    # читаем только обычным токеном (RO токен — опционально, можно расширить потом)
-    value = await upstash_get(SCENARIO_KEY, KV_REST_API_TOKEN)
+    value = await kv_get(SCENARIO_KEY, KV_REST_API_READ_ONLY_TOKEN)
     if value in ALLOWED_SCENARIOS:
         return value
     return "neutral"
 
 
 async def set_scenario(value: str) -> str:
+    value = (value or "").strip().lower()
     if value not in ALLOWED_SCENARIOS:
         raise HTTPException(status_code=422, detail=f"Invalid scenario. Allowed: {sorted(ALLOWED_SCENARIOS)}")
 
-    if not KV_REST_API_URL or not KV_REST_API_TOKEN:
-        raise HTTPException(status_code=500, detail="KV not configured: cannot persist scenario")
-
-    ok = await upstash_set(SCENARIO_KEY, value, KV_REST_API_TOKEN)
+    ok = await kv_set(SCENARIO_KEY, value, KV_REST_API_TOKEN)
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to save scenario to KV")
 
@@ -152,7 +155,7 @@ class ScenarioBody(BaseModel):
 
 
 # ============================================================
-# Fake Agents (A1)
+# Fake Agents
 # ============================================================
 AGENT_NAMES = [
     "Market Microstructure",
@@ -174,13 +177,6 @@ AGENT_NAMES = [
 
 
 def _agent_decision(agent_idx: int, scenario: str) -> Dict[str, Any]:
-    """
-    Фейковая логика:
-    - В bull большинство склоняется к BUY
-    - В bear большинство склоняется к HOLD (или SELL, но пока делаем BUY/HOLD)
-    - В neutral смешанно
-    Плюс небольшой псевдо-рандом, но детерминированный на (agent_idx, scenario)
-    """
     seed = (agent_idx + 1) * 1000 + {"bull": 1, "neutral": 2, "bear": 3}[scenario]
     rnd = random.Random(seed)
 
@@ -193,7 +189,7 @@ def _agent_decision(agent_idx: int, scenario: str) -> Dict[str, Any]:
 
     vote_buy = rnd.random() < buy_prob
 
-    confidence = round(0.55 + rnd.random() * 0.4, 2)  # 0.55..0.95
+    confidence = round(0.55 + rnd.random() * 0.4, 2)
     if not vote_buy:
         confidence = round(max(0.5, confidence - 0.15), 2)
 
@@ -212,7 +208,6 @@ def _agent_decision(agent_idx: int, scenario: str) -> Dict[str, Any]:
 
     reason = rnd.choice(reason_templates_buy if vote_buy else reason_templates_hold)
 
-    # Фейковые "сигналы" (заготовленные числа, просто чтобы выглядело как анализ)
     signals = {
         "price": round(0.35 + rnd.random() * 0.55, 3),
         "implied_prob": round(0.35 + rnd.random() * 0.55, 3),
@@ -241,8 +236,6 @@ def aggregate_decision(agent_reports: List[Dict[str, Any]]) -> Dict[str, Any]:
     buy_count = len(buys)
     hold_count = len(holds)
 
-    # Простое правило (пока):
-    # BUY если >= 9 агентов за BUY, иначе HOLD.
     decision = "BUY" if buy_count >= 9 else "HOLD"
 
     avg_conf = round(sum(a["confidence"] for a in agent_reports) / max(1, len(agent_reports)), 3)
@@ -259,9 +252,53 @@ def aggregate_decision(agent_reports: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ============================================================
+# Public latest storage
+# ============================================================
+def _now_ts() -> int:
+    return int(time.time())
+
+
+def _tick_index(ts: int) -> int:
+    # 5-min buckets
+    return int(ts / 300)
+
+
+async def save_public_latest(payload: Dict[str, Any]) -> None:
+    """
+    Сохраняем JSON в KV.
+    Важно: Upstash /set/<key>/<value> использует value в path,
+    поэтому JSON нужно сериализовать и закодировать.
+    Здесь мы используем /set/<key>/<value> напрямую -> это ломается на спецсимволах.
+    Поэтому мы сохраняем через base64 безопаснее.
+    """
+    # безопасно сохраняем JSON как base64, чтобы не ломать URL
+    import base64
+
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    b64 = base64.urlsafe_b64encode(raw).decode("utf-8")
+
+    ok = await kv_set(PUBLIC_LATEST_KEY, b64, KV_REST_API_TOKEN)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to persist public:latest")
+
+
+async def load_public_latest() -> Optional[Dict[str, Any]]:
+    import base64
+
+    b64 = await kv_get(PUBLIC_LATEST_KEY, KV_REST_API_READ_ONLY_TOKEN)
+    if not b64:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(b64.encode("utf-8"))
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+# ============================================================
 # App
 # ============================================================
-app = FastAPI(title="Polyclawd Executor", version="0.2.0")
+app = FastAPI(title="Polyclawd Executor", version="0.3.0")
 
 
 @app.get("/")
@@ -278,10 +315,12 @@ async def healthz():
         "has_kv_token": bool(KV_REST_API_TOKEN),
         "lock_key": LOCK_KEY,
         "scenario_key": SCENARIO_KEY,
+        "public_latest_key": PUBLIC_LATEST_KEY,
         "position_id": POSITION_ID,
     }
 
 
+# ---------- Scenario control (admin) ----------
 @app.get("/scenario")
 async def scenario_get(_: bool = Depends(require_auth)):
     s = await get_scenario()
@@ -294,30 +333,47 @@ async def scenario_post(body: ScenarioBody, _: bool = Depends(require_auth)):
     return {"ok": True, "scenario": s, "key": SCENARIO_KEY}
 
 
+# ---------- Public endpoints (no auth) ----------
+@app.get("/public/health")
+async def public_health():
+    latest = await load_public_latest()
+    return {"ok": True, "has_latest": bool(latest), "latest_ts": latest.get("ts") if latest else None}
+
+
+@app.get("/public/latest")
+async def public_latest():
+    latest = await load_public_latest()
+    if not latest:
+        return {"ok": True, "empty": True, "message": "No data yet. Wait for /run to execute at least once."}
+    return {"ok": True, "data": latest}
+
+
+# ---------- Executor tick ----------
 @app.post("/run")
 async def run(_: bool = Depends(require_auth)):
-    """
-    Запускается GitHub Actions cron-ом.
-    Требует: Authorization: Bearer <EXECUTOR_SECRET>
-    """
     started = time.time()
 
-    # lock, чтобы не было параллельных тиков
     lock_id = await try_lock()
     if not lock_id:
-        return {
-            "ok": True,
-            "skipped": True,
-            "reason": "locked",
-            "message": "Another executor run is in progress",
-        }
+        return {"ok": True, "skipped": True, "reason": "locked", "message": "Another run is in progress"}
 
     try:
         scenario = await get_scenario()
 
-        # A1: фейковые агенты
         agents = run_fake_agents(scenario)
         summary = aggregate_decision(agents)
+
+        ts = _now_ts()
+        payload = {
+            "ts": ts,
+            "tick": _tick_index(ts),
+            "position_id": POSITION_ID,
+            "scenario": scenario,
+            "summary": summary,
+            "agents": agents,
+        }
+
+        await save_public_latest(payload)
 
         duration = round(time.time() - started, 3)
         return {
@@ -325,10 +381,8 @@ async def run(_: bool = Depends(require_auth)):
             "skipped": False,
             "message": "tick executed",
             "duration_sec": duration,
-            "position_id": POSITION_ID,
-            "scenario": scenario,
-            "summary": summary,
-            "agents": agents,
+            "saved_to": PUBLIC_LATEST_KEY,
+            "data": payload,
         }
 
     except Exception as e:
