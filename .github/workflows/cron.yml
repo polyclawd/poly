@@ -11,6 +11,7 @@ jobs:
     steps:
       - name: Call executor
         run: |
-          curl -sS -X POST "https://poly-lm6c.onrender.com" \
+          curl -sS -X POST "${{ secrets.EXECUTOR_URL }}/run" \
             -H "Authorization: Bearer ${{ secrets.EXECUTOR_SECRET }}" \
+            -H "Content-Type: application/json" \
             --max-time 30
