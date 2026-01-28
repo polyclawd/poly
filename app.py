@@ -8,172 +8,102 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from prebaked_data import get_prebaked_snapshot
+from scenario import get_scenario, set_scenario
 
 # ============================
-# Config (ENV ONLY)
+# Config
 # ============================
-EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "")
+EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "executor-secret-polyclawd-2026")
 
-KV_REST_API_URL = os.getenv("KV_REST_API_URL", "").rstrip("/")
-KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "")
+KV_REST_API_URL = os.getenv("KV_REST_API_URL", "https://thankful-bluegill-32910.upstash.io").rstrip("/")
+KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "AYCOAAIncDI5OTM2N2MzOTBiNGE0NzJjODhjZTZjZWQzNzBjMDI5MXAyMzI5MTA")
 
 LOCK_KEY = os.getenv("EXECUTOR_LOCK_KEY", "executor:lock")
 
 # ============================
-# Auth (Swagger "Authorize")
+# Auth
 # ============================
 bearer = HTTPBearer(auto_error=False)
 
 
 def require_auth(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> bool:
     if not EXECUTOR_SECRET:
-        raise HTTPException(status_code=500, detail="Server misconfigured: EXECUTOR_SECRET is empty")
+        raise HTTPException(status_code=500, detail="EXECUTOR_SECRET missing")
 
     if creds is None:
         raise HTTPException(status_code=403, detail="Not authenticated")
 
-    token = creds.credentials
-    if token != EXECUTOR_SECRET:
+    if creds.credentials != EXECUTOR_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     return True
 
 
 # ============================
-# Upstash REST helpers (lock only)
+# Upstash lock
 # ============================
-def _upstash_headers(token: str) -> dict:
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-
-
-async def upstash_setnx(key: str, value: str, token: str) -> int:
-    if not KV_REST_API_URL or not token:
-        raise HTTPException(status_code=500, detail="Server misconfigured: KV_REST_API_URL / KV_REST_API_TOKEN is empty")
-
-    url = f"{KV_REST_API_URL}/setnx/{key}/{value}"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.post(url, headers=_upstash_headers(token))
-
-    if r.status_code == 401:
-        raise HTTPException(status_code=500, detail="Upstash 401 Unauthorized: check KV_REST_API_TOKEN")
-
-    r.raise_for_status()
-    data = r.json()
-    return int(data.get("result", 0))
-
-
-async def upstash_del(key: str, token: str) -> int:
-    if not KV_REST_API_URL or not token:
-        return 0
-
-    url = f"{KV_REST_API_URL}/del/{key}"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.post(url, headers=_upstash_headers(token))
-
-    r.raise_for_status()
-    data = r.json()
-    return int(data.get("result", 0))
+def _headers():
+    return {"Authorization": f"Bearer {KV_REST_API_TOKEN}", "Accept": "application/json"}
 
 
 async def try_lock() -> Optional[str]:
     lock_id = str(uuid.uuid4())
-    ok = await upstash_setnx(LOCK_KEY, lock_id, KV_REST_API_TOKEN)
-    if ok == 1:
+    url = f"{KV_REST_API_URL}/setnx/{LOCK_KEY}/{lock_id}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=_headers())
+    if r.status_code == 200 and r.json().get("result") == 1:
         return lock_id
     return None
 
 
-async def unlock(lock_id: str) -> None:
-    await upstash_del(LOCK_KEY, KV_REST_API_TOKEN)
+async def unlock():
+    url = f"{KV_REST_API_URL}/del/{LOCK_KEY}"
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(url, headers=_headers())
 
 
 # ============================
-# Fake agents
+# Agents
 # ============================
 Signal = Literal["BUY", "SELL", "HOLD"]
 
 AGENTS: List[Dict[str, str]] = [
-    {"id": "A01", "role": "Market Analyst"},
-    {"id": "A02", "role": "News Analyst"},
-    {"id": "A03", "role": "Social Sentiment"},
-    {"id": "A04", "role": "Orderbook/Microstructure"},
-    {"id": "A05", "role": "Volatility/Risk"},
-    {"id": "A06", "role": "Macro Context"},
-    {"id": "A07", "role": "Contrarian"},
-    {"id": "A08", "role": "Momentum"},
-    {"id": "A09", "role": "Mean Reversion"},
-    {"id": "A10", "role": "Liquidity"},
-    {"id": "A11", "role": "Event Calendar"},
-    {"id": "A12", "role": "Position Sizing"},
-    {"id": "A13", "role": "Execution Safety"},
-    {"id": "A14", "role": "Compliance/Guardrails"},
-    {"id": "A15", "role": "Final Reviewer"},
+    {"id": f"A{i:02d}", "role": f"Agent {i}"} for i in range(1, 16)
 ]
 
 
-def _agent_decide(agent: Dict[str, str], snap: Dict[str, Any]) -> Dict[str, Any]:
-    scenario = snap.get("scenario", "neutral")
-
+def agent_decide(agent: Dict[str, str], snap: Dict[str, Any]) -> Dict[str, Any]:
+    scenario = snap["scenario"]
     if scenario == "bull":
-        signal: Signal = "BUY"
-        conf = 0.70
+        signal, conf = "BUY", 0.7
     elif scenario == "bear":
-        signal = "SELL"
-        conf = 0.70
+        signal, conf = "SELL", 0.7
     else:
-        signal = "HOLD"
-        conf = 0.55
-
-    notes = [
-        f"scenario={scenario}",
-        f"market_price={snap.get('market_price')}",
-        f"fair_value={snap.get('fair_value')}",
-        snap.get("headline", ""),
-    ]
-
-    evidence_items = []
-    for item in (snap.get("news", [])[:1] + snap.get("social", [])[:1]):
-        evidence_items.append(
-            {
-                "title": item.get("title", "evidence"),
-                "snippet": item.get("snippet", ""),
-                "url": item.get("url"),
-                "score": float(item.get("score", 0.5)),
-            }
-        )
+        signal, conf = "HOLD", 0.55
 
     return {
         "agent_id": agent["id"],
         "role": agent["role"],
         "signal": signal,
-        "confidence": round(conf, 3),
-        "notes": notes,
-        "evidence": {"source": "prebaked", "items": evidence_items},
+        "confidence": conf,
+        "notes": [snap["headline"]],
+        "evidence": {
+            "source": "prebaked",
+            "items": snap["news"][:1] + snap["social"][:1],
+        },
     }
 
 
-def _aggregate(agents_out: List[Dict[str, Any]]) -> Dict[str, Any]:
-    score = 0.0
-    conf_sum = 0.0
+def aggregate(agents: List[Dict[str, Any]]) -> Dict[str, Any]:
+    score = sum(
+        (1 if a["signal"] == "BUY" else -1 if a["signal"] == "SELL" else 0) * a["confidence"]
+        for a in agents
+    )
+    avg_conf = sum(a["confidence"] for a in agents) / len(agents)
 
-    for a in agents_out:
-        s = a["signal"]
-        c = float(a.get("confidence", 0.0))
-        conf_sum += c
-
-        if s == "BUY":
-            score += 1.0 * c
-        elif s == "SELL":
-            score += -1.0 * c
-
-    avg_conf = (conf_sum / max(len(agents_out), 1)) if agents_out else 0.0
-
-    if score >= 2.5:
-        decision: Signal = "BUY"
-    elif score <= -2.5:
+    if score > 2.5:
+        decision = "BUY"
+    elif score < -2.5:
         decision = "SELL"
     else:
         decision = "HOLD"
@@ -184,60 +114,41 @@ def _aggregate(agents_out: List[Dict[str, Any]]) -> Dict[str, Any]:
 # ============================
 # App
 # ============================
-app = FastAPI(title="Polyclawd Executor", version="0.3.0")
-
-
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "executor", "docs": "/docs", "health": "/healthz"}
+app = FastAPI(title="Polyclawd Executor", version="0.4.0")
 
 
 @app.get("/healthz")
 async def healthz():
-    return {
-        "ok": True,
-        "has_executor_secret": bool(EXECUTOR_SECRET),
-        "has_kv_url": bool(KV_REST_API_URL),
-        "has_kv_token": bool(KV_REST_API_TOKEN),
-        "lock_key": LOCK_KEY,
-    }
+    return {"ok": True}
+
+
+@app.post("/scenario/{value}")
+async def change_scenario(value: Literal["neutral", "bull", "bear"], _: bool = Depends(require_auth)):
+    ok = await set_scenario(value)
+    return {"ok": ok, "scenario": value}
 
 
 @app.post("/run")
 async def run(_: bool = Depends(require_auth)):
-    started = time.time()
-
-    lock_id = await try_lock()
-    if not lock_id:
-        return {"ok": True, "skipped": True, "reason": "locked", "message": "Another executor run is in progress"}
+    lock = await try_lock()
+    if not lock:
+        return {"ok": True, "skipped": True}
 
     try:
-        snap = get_prebaked_snapshot()
+        scenario = await get_scenario()
+        snap = get_prebaked_snapshot(scenario)
 
-        agents_out = [_agent_decide(agent, snap) for agent in AGENTS]
-        agg = _aggregate(agents_out)
-
-        duration = round(time.time() - started, 3)
+        agents_out = [agent_decide(a, snap) for a in AGENTS]
+        agg = aggregate(agents_out)
 
         return {
             "ok": True,
-            "skipped": False,
-            "message": "tick executed",
-            "ts": snap.get("ts"),
-            "tick_index": snap.get("tick_index"),
-            "scenario": snap.get("scenario"),
-            "position": snap.get("position"),
-            "market_price": snap.get("market_price"),
-            "fair_value": snap.get("fair_value"),
+            "scenario": scenario,
+            "tick_index": snap["tick_index"],
             "decision": agg["decision"],
             "score": agg["score"],
             "avg_conf": agg["avg_conf"],
             "agents": agents_out,
-            "duration_sec": duration,
         }
-
     finally:
-        try:
-            await unlock(lock_id)
-        except Exception:
-            pass
+        await unlock()
