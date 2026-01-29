@@ -586,6 +586,7 @@ async def run(_: bool = Depends(require_auth)):
 
         # tick increments (demo): based on unix time / 900 sec (15 min)
         tick = int(time.time() // 900)
+        run_id = str(uuid.uuid4())
 
         # 1) analyze all markets
         analyses = []
@@ -647,6 +648,8 @@ async def run(_: bool = Depends(require_auth)):
             mid = a["market_id"]
             item = {
                 "ts": int(time.time()),
+                "ts_ms": int(time.time() * 1000),
+                "run_id": run_id,
                 "tick": tick,
                 "market_id": mid,
                 "scenario": scenario,
@@ -674,6 +677,8 @@ async def run(_: bool = Depends(require_auth)):
             "message": "tick executed",
             "tick": tick,
             "scenario": scenario,
+            "run_id": run_id,
+            "ts_ms": int(time.time() * 1000),
             "portfolio": {"cash": p["cash"], "open_positions": len(p["positions"])},
             "duration_sec": duration,
         }
