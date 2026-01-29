@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 import json
+import asyncio
 from typing import Optional, Dict, Any, List
 from urllib.parse import quote
 
@@ -15,8 +16,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # ----------------------------
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "executor-secret-polyclawd-2026")
 
-KV_REST_API_URL = os.getenv("KV_REST_API_URL", "").rstrip("/")
-KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "")
+KV_REST_API_URL = os.getenv("KV_REST_API_URL", "https://thankful-bluegill-32910.upstash.io").rstrip("/")
+KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "AYCOAAIncDI5OTM2N2MzOTBiNGE0NzJjODhjZTZjZWQzNzBjMDI5MXAyMzI5MTA")
 
 LOCK_KEY = os.getenv("EXECUTOR_LOCK_KEY", "executor:lock")
 LOCK_TTL_SECONDS = int(os.getenv("EXECUTOR_LOCK_TTL_SECONDS", "60"))
@@ -32,6 +33,8 @@ HISTORY_MAX_ITEMS = int(os.getenv("EXECUTOR_HISTORY_MAX_ITEMS", "120"))
 
 HTTP_TIMEOUT = float(os.getenv("EXECUTOR_HTTP_TIMEOUT", "12"))
 
+# Агентам даём максимум времени на “анализ” (фейковый/реальный)
+AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS", "2.5"))
 
 # ----------------------------
 # FastAPI
@@ -60,7 +63,7 @@ def require_auth(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> bool:
 
 
 # ----------------------------
-# Upstash helpers (SAFE URL ENCODING)
+# Upstash helpers
 # ----------------------------
 def _upstash_headers(token: str) -> Dict[str, str]:
     return {
@@ -97,7 +100,6 @@ async def _upstash_request(method: str, path: str, token: str) -> Dict[str, Any]
 
     if r.status_code >= 400:
         txt = r.text or ""
-        # Upstash иногда отдаёт {"error":"WRONGTYPE ..."}
         if "WRONGTYPE" in txt:
             raise UpstashWrongType(txt)
         raise HTTPException(status_code=500, detail=f"Upstash error {r.status_code}: {txt}")
@@ -131,13 +133,12 @@ async def upstash_expire(key: str, seconds: int, token: str) -> None:
 
 
 # ----------------------------
-# “Safe” wrappers that auto-heal WRONGTYPE by deleting the key once
+# Safe wrappers (auto-heal WRONGTYPE)
 # ----------------------------
 async def safe_get_string(key: str) -> Optional[str]:
     try:
         return await upstash_get(key, KV_REST_API_TOKEN)
     except UpstashWrongType:
-        # ключ был не строкой — удаляем и считаем “пустым”
         await upstash_del(key, KV_REST_API_TOKEN)
         return None
 
@@ -210,7 +211,7 @@ async def set_scenario(s: str) -> str:
 
 
 # ----------------------------
-# Fake agents (15)
+# Agents (15)
 # ----------------------------
 AGENTS: List[Dict[str, str]] = [
     {"agent_id": "agent_01", "name": "Market Microstructure"},
@@ -249,8 +250,21 @@ def _rand01(seed: int) -> float:
     return (x % 10000) / 10000.0
 
 
-def fake_agent_vote(agent_idx: int, tick: int, scenario: str) -> Dict[str, Any]:
+async def run_agent(agent_idx: int, tick: int, scenario: str) -> Dict[str, Any]:
+    """
+    Сейчас агент "фейковый", но:
+    - запускается параллельно
+    - умеет таймаут/ошибку
+    В будущем сюда вставим реальные API вызовы.
+    """
+    meta = AGENTS[agent_idx]
     base_seed = (tick + 1) * 1000 + agent_idx * 97
+
+    # фейковая задержка, чтобы было видно что параллельно
+    # (разные агенты тратят разное время)
+    delay = 0.05 + _rand01(base_seed + 3) * 0.25
+    await asyncio.sleep(delay)
+
     r = _rand01(base_seed)
 
     bias = 0.0
@@ -273,8 +287,9 @@ def fake_agent_vote(agent_idx: int, tick: int, scenario: str) -> Dict[str, Any]:
     }
 
     return {
-        "agent_id": AGENTS[agent_idx]["agent_id"],
-        "name": AGENTS[agent_idx]["name"],
+        "status": "ok",
+        "agent_id": meta["agent_id"],
+        "name": meta["name"],
         "vote": vote,
         "confidence": conf,
         "reason": reason,
@@ -283,10 +298,12 @@ def fake_agent_vote(agent_idx: int, tick: int, scenario: str) -> Dict[str, Any]:
 
 
 def summarize(agents: List[Dict[str, Any]]) -> Dict[str, Any]:
-    buy = sum(1 for a in agents if a["vote"] == "BUY")
-    hold = sum(1 for a in agents if a["vote"] == "HOLD")
-    avg_conf = round(sum(float(a["confidence"]) for a in agents) / max(1, len(agents)), 3)
-
+    buy = sum(1 for a in agents if a.get("vote") == "BUY")
+    hold = sum(1 for a in agents if a.get("vote") == "HOLD")
+    avg_conf = round(
+        sum(float(a.get("confidence", 0.0)) for a in agents if a.get("status") == "ok") / max(1, sum(1 for a in agents if a.get("status") == "ok")),
+        3,
+    )
     decision = "BUY" if buy >= 9 else "HOLD"
     return {
         "decision": decision,
@@ -298,9 +315,9 @@ def summarize(agents: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def make_digest(agents: List[Dict[str, Any]]) -> Dict[str, Any]:
-    buy_reasons = [a["reason"] for a in agents if a["vote"] == "BUY"][:3]
+    buy_reasons = [a["reason"] for a in agents if a.get("vote") == "BUY"][:3]
     return {
-        "buy_count": sum(1 for a in agents if a["vote"] == "BUY"),
+        "buy_count": sum(1 for a in agents if a.get("vote") == "BUY"),
         "top_buy_reasons": buy_reasons,
     }
 
@@ -321,6 +338,7 @@ async def healthz():
         "has_kv_url": bool(KV_REST_API_URL),
         "has_kv_token": bool(KV_REST_API_TOKEN),
         "default_market_id": DEFAULT_MARKET_ID,
+        "agent_timeout_sec": AGENT_TIMEOUT_SECONDS,
     }
 
 
@@ -368,7 +386,6 @@ async def public_history(market_id: str):
 
 @app.post("/admin/reset")
 async def admin_reset(_: bool = Depends(require_auth)):
-    # Удаляем ключи, которые чаще всего ломаются типом
     keys = [
         LOCK_KEY,
         SCENARIO_KEY,
@@ -394,12 +411,34 @@ async def run(_: bool = Depends(require_auth)):
     try:
         scenario = await get_scenario()
         market_id = DEFAULT_MARKET_ID
-
         tick = int(time.time() // 300)
 
-        agents = [fake_agent_vote(i, tick, scenario) for i in range(len(AGENTS))]
-        summary = summarize(agents)
-        digest = make_digest(agents)
+        # --- ПАРАЛЛЕЛЬНО запускаем 15 агентов ---
+        tasks = []
+        for i in range(len(AGENTS)):
+            coro = run_agent(i, tick, scenario)
+            tasks.append(asyncio.wait_for(coro, timeout=AGENT_TIMEOUT_SECONDS))
+
+        results: List[Dict[str, Any]] = []
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for i, g in enumerate(gathered):
+            meta = AGENTS[i]
+            if isinstance(g, Exception):
+                results.append({
+                    "status": "error",
+                    "agent_id": meta["agent_id"],
+                    "name": meta["name"],
+                    "vote": "HOLD",
+                    "confidence": 0.5,
+                    "reason": f"Agent failed: {type(g).__name__}",
+                    "signals": {},
+                })
+            else:
+                results.append(g)
+
+        summary = summarize(results)
+        digest = make_digest(results)
 
         item = {
             "ts": int(time.time()),
@@ -408,16 +447,11 @@ async def run(_: bool = Depends(require_auth)):
             "scenario": scenario,
             "summary": summary,
             "digest": digest,
-            "agents": agents,
+            "agents": results,
         }
 
-        latest_payload = {
-            "ok": True,
-            "market_id": market_id,
-            "data": item,
-        }
+        latest_payload = {"ok": True, "market_id": market_id, "data": item}
 
-        # latest (string)
         lk = latest_key(market_id)
         await safe_set_string(lk, json.dumps(latest_payload, ensure_ascii=False))
         try:
@@ -425,7 +459,6 @@ async def run(_: bool = Depends(require_auth)):
         except Exception:
             pass
 
-        # history (string with JSON list)
         hk = history_key(market_id)
         raw_hist = await safe_get_string(hk)
         hist: List[Dict[str, Any]] = []
