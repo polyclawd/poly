@@ -3,6 +3,7 @@ import time
 import uuid
 import json
 from typing import Optional, Any, Dict, List
+from urllib.parse import quote
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -14,17 +15,15 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # ----------------------------
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "executor-secret-polyclawd-2026")
 KV_REST_API_URL = os.getenv("KV_REST_API_URL", "https://thankful-bluegill-32910.upstash.io").rstrip("/")
-KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "AYCOAAIncDI5OTM2N2MzOTBiNGE0NzJjODhjZTZjZWQzNzBjMDI5MXAyMzI5MTA").strip()
+KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "").strip()
 KV_REST_API_READ_ONLY_TOKEN = os.getenv("KV_REST_API_READ_ONLY_TOKEN", "").strip()
 
 LOCK_KEY = os.getenv("EXECUTOR_LOCK_KEY", "executor:lock")
 LOCK_TTL_SECONDS = int(os.getenv("EXECUTOR_LOCK_TTL_SECONDS", "60"))
 RUN_TIMEOUT_SECONDS = float(os.getenv("EXECUTOR_RUN_TIMEOUT_SECONDS", "25"))
 
-# Demo market
 DEFAULT_MARKET_ID = os.getenv("DEFAULT_MARKET_ID", "POLY:DEMO_001")
 
-# Where we store scenario + outputs
 SCENARIO_KEY = os.getenv("EXECUTOR_SCENARIO_KEY", "executor:scenario")
 LATEST_PREFIX = os.getenv("EXECUTOR_LATEST_PREFIX", "executor:latest:")
 HISTORY_PREFIX = os.getenv("EXECUTOR_HISTORY_PREFIX", "executor:history:")
@@ -43,8 +42,7 @@ def require_auth(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> bool:
         raise HTTPException(status_code=500, detail="Server misconfigured: EXECUTOR_SECRET is empty")
     if creds is None:
         raise HTTPException(status_code=403, detail="Not authenticated")
-    token = creds.credentials
-    if token != EXECUTOR_SECRET:
+    if creds.credentials != EXECUTOR_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return True
 
@@ -54,6 +52,11 @@ def require_auth(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> bool:
 # ----------------------------
 def _upstash_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+
+def _enc(v: str) -> str:
+    # Upstash Redis REST uses path params; must URL-encode
+    return quote(v, safe="")
 
 
 async def _upstash_post(path: str, token: str) -> Dict[str, Any]:
@@ -81,47 +84,43 @@ async def _upstash_get(path: str, token: str) -> Dict[str, Any]:
 
 
 async def upstash_set(key: str, value: str, token: str) -> None:
-    await _upstash_post(f"set/{key}/{httpx.utils.quote(value, safe='')}", token)
+    await _upstash_post(f"set/{_enc(key)}/{_enc(value)}", token)
 
 
 async def upstash_get(key: str, token: str) -> Optional[str]:
-    data = await _upstash_get(f"get/{key}", token)
-    # Upstash returns {"result": "..."} or {"result": null}
+    data = await _upstash_get(f"get/{_enc(key)}", token)
     return data.get("result")
 
 
 async def upstash_setnx(key: str, value: str, token: str) -> int:
-    data = await _upstash_post(f"setnx/{key}/{value}", token)
+    data = await _upstash_post(f"setnx/{_enc(key)}/{_enc(value)}", token)
     return int(data.get("result", 0))
 
 
 async def upstash_del(key: str, token: str) -> int:
-    data = await _upstash_post(f"del/{key}", token)
+    data = await _upstash_post(f"del/{_enc(key)}", token)
     return int(data.get("result", 0))
 
 
 async def upstash_lpush(key: str, value: str, token: str) -> int:
-    data = await _upstash_post(f"lpush/{key}/{httpx.utils.quote(value, safe='')}", token)
+    data = await _upstash_post(f"lpush/{_enc(key)}/{_enc(value)}", token)
     return int(data.get("result", 0))
 
 
 async def upstash_ltrim(key: str, start: int, stop: int, token: str) -> str:
-    data = await _upstash_post(f"ltrim/{key}/{start}/{stop}", token)
+    data = await _upstash_post(f"ltrim/{_enc(key)}/{start}/{stop}", token)
     return str(data.get("result", ""))
 
 
 async def upstash_lrange(key: str, start: int, stop: int, token: str) -> List[str]:
-    data = await _upstash_get(f"lrange/{key}/{start}/{stop}", token)
-    # result is array
+    data = await _upstash_get(f"lrange/{_enc(key)}/{start}/{stop}", token)
     return data.get("result") or []
 
 
 async def try_lock() -> Optional[str]:
     lock_id = str(uuid.uuid4())
     ok = await upstash_setnx(LOCK_KEY, lock_id, KV_REST_API_TOKEN)
-    if ok == 1:
-        return lock_id
-    return None
+    return lock_id if ok == 1 else None
 
 
 async def unlock(_: str) -> None:
@@ -151,8 +150,8 @@ AGENTS_PRESET = [
 
 
 def _vote_for(i: int, scenario: str) -> Dict[str, Any]:
-    # deterministic-ish fake votes per tick
     base = (i * 37 + int(time.time()) // 60) % 100
+
     if scenario == "bull":
         vote = "BUY" if base < 75 else "HOLD"
     elif scenario == "bear":
@@ -161,6 +160,7 @@ def _vote_for(i: int, scenario: str) -> Dict[str, Any]:
         vote = "BUY" if base < 55 else "HOLD"
 
     conf = round(0.45 + (base % 40) / 100, 2)
+
     reasons_buy = [
         "Liquidity acceptable; expected value positive this tick.",
         "Edge detected; scenario tailwind supports entry.",
@@ -173,7 +173,7 @@ def _vote_for(i: int, scenario: str) -> Dict[str, Any]:
         "Volatility elevated; reduce risk this tick.",
         "Consensus weak; hold for confirmation.",
     ]
-    reason = (reasons_buy[base % len(reasons_buy)] if vote == "BUY" else reasons_hold[base % len(reasons_hold)])
+    reason = reasons_buy[base % len(reasons_buy)] if vote == "BUY" else reasons_hold[base % len(reasons_hold)]
 
     signals = {
         "price": round(((base % 100) / 100), 3),
@@ -201,15 +201,13 @@ def compute_tick(market_id: str, scenario: str) -> Dict[str, Any]:
     decision = "BUY" if buy_count >= 9 else "HOLD"
     avg_conf = round(sum(x["confidence"] for x in agents) / len(agents), 3)
 
-    # build digest
     top_buy_reasons = [x["reason"] for x in agents if x["vote"] == "BUY"][:3]
 
-    # tick counter (not perfect, but stable-ish)
     tick = int(time.time() // 60)
 
     return {
         "market_id": market_id,
-        "ts": int(time.time()),  # seconds
+        "ts": int(time.time()),
         "tick": tick,
         "scenario": scenario,
         "summary": {
@@ -219,10 +217,7 @@ def compute_tick(market_id: str, scenario: str) -> Dict[str, Any]:
             "avg_confidence": avg_conf,
             "rule": rule,
         },
-        "digest": {
-            "buy_count": buy_count,
-            "top_buy_reasons": top_buy_reasons,
-        },
+        "digest": {"buy_count": buy_count, "top_buy_reasons": top_buy_reasons},
         "agents": agents,
     }
 
@@ -258,9 +253,7 @@ async def healthz():
 @app.get("/scenario")
 async def scenario_get(_: bool = Depends(require_auth)):
     s = await upstash_get(SCENARIO_KEY, KV_REST_API_TOKEN)
-    if not s:
-        s = "neutral"
-    return {"ok": True, "scenario": s, "key": SCENARIO_KEY}
+    return {"ok": True, "scenario": (s or "neutral"), "key": SCENARIO_KEY}
 
 
 @app.post("/scenario")
@@ -278,7 +271,8 @@ async def scenario_set(body: Dict[str, Any], _: bool = Depends(require_auth)):
 @app.get("/public/latest/{market_id}")
 async def public_latest(market_id: str):
     key = f"{LATEST_PREFIX}{market_id}"
-    raw = await upstash_get(key, KV_REST_API_READ_ONLY_TOKEN or KV_REST_API_TOKEN)
+    ro = KV_REST_API_READ_ONLY_TOKEN or KV_REST_API_TOKEN
+    raw = await upstash_get(key, ro)
     if not raw:
         return {"ok": False, "market_id": market_id, "error": "no data yet"}
     try:
@@ -294,16 +288,13 @@ async def public_history(
     minutes: int = Query(60, ge=1, le=24 * 60),
     limit: int = Query(200, ge=1, le=500),
 ):
-    """
-    Returns last N items (bounded by limit) filtered by minutes window.
-    """
     key = f"{HISTORY_PREFIX}{market_id}"
     ro = KV_REST_API_READ_ONLY_TOKEN or KV_REST_API_TOKEN
+
     items = await upstash_lrange(key, 0, limit - 1, ro)
 
     now_ms = int(time.time() * 1000)
-    window_ms = minutes * 60 * 1000
-    cutoff = now_ms - window_ms
+    cutoff_ms = now_ms - minutes * 60 * 1000
 
     parsed: List[Dict[str, Any]] = []
     for raw in items:
@@ -317,14 +308,11 @@ async def public_history(
             parsed.append(obj)
             continue
 
-        # normalize seconds vs ms
         ts = int(ts)
         ts_ms = ts * 1000 if ts < 10_000_000_000 else ts
-
-        if ts_ms >= cutoff:
+        if ts_ms >= cutoff_ms:
             parsed.append(obj)
 
-    # newest -> oldest (LPUSH already newest first, but keep deterministic)
     parsed.sort(key=lambda x: x.get("ts", 0), reverse=True)
 
     return {
@@ -334,8 +322,6 @@ async def public_history(
         "limit": limit,
         "raw_count": len(items),
         "count": len(parsed),
-        "now_ms": now_ms,
-        "cutoff_ms": cutoff,
         "items": parsed,
     }
 
@@ -352,18 +338,13 @@ async def run(_: bool = Depends(require_auth)):
         return {"ok": True, "skipped": True, "reason": "locked", "message": "Another executor run is in progress"}
 
     try:
-        scenario = await upstash_get(SCENARIO_KEY, KV_REST_API_TOKEN)
-        if not scenario:
-            scenario = "neutral"
-
+        scenario = (await upstash_get(SCENARIO_KEY, KV_REST_API_TOKEN)) or "neutral"
         market_id = DEFAULT_MARKET_ID
         payload = compute_tick(market_id, scenario)
 
-        # save latest
         latest_key = f"{LATEST_PREFIX}{market_id}"
         await upstash_set(latest_key, json.dumps(payload), KV_REST_API_TOKEN)
 
-        # append to history (LPUSH newest first) and trim
         history_key = f"{HISTORY_PREFIX}{market_id}"
         await upstash_lpush(history_key, json.dumps(payload), KV_REST_API_TOKEN)
         await upstash_ltrim(history_key, 0, HISTORY_MAX - 1, KV_REST_API_TOKEN)
