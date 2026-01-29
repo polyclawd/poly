@@ -33,8 +33,11 @@ HISTORY_MAX_ITEMS = int(os.getenv("EXECUTOR_HISTORY_MAX_ITEMS", "120"))
 
 HTTP_TIMEOUT = float(os.getenv("EXECUTOR_HTTP_TIMEOUT", "12"))
 
-# Агентам даём максимум времени на “анализ” (фейковый/реальный)
 AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS", "2.5"))
+
+PRESET_FILE = os.getenv("AGENTS_PRESET_FILE", "agents_preset.json")
+PRESET_INDEX_KEY = os.getenv("PRESET_INDEX_KEY", "executor:preset_index")
+
 
 # ----------------------------
 # FastAPI
@@ -211,97 +214,66 @@ async def set_scenario(s: str) -> str:
 
 
 # ----------------------------
-# Agents (15)
+# Presets loader
 # ----------------------------
-AGENTS: List[Dict[str, str]] = [
-    {"agent_id": "agent_01", "name": "Market Microstructure"},
-    {"agent_id": "agent_02", "name": "Orderbook Reader"},
-    {"agent_id": "agent_03", "name": "News Synthesizer"},
-    {"agent_id": "agent_04", "name": "Social Sentiment"},
-    {"agent_id": "agent_05", "name": "Volatility Monitor"},
-    {"agent_id": "agent_06", "name": "Flow Tracker"},
-    {"agent_id": "agent_07", "name": "Liquidity Scout"},
-    {"agent_id": "agent_08", "name": "Contrarian"},
-    {"agent_id": "agent_09", "name": "Momentum"},
-    {"agent_id": "agent_10", "name": "Mean Reversion"},
-    {"agent_id": "agent_11", "name": "Risk Manager"},
-    {"agent_id": "agent_12", "name": "Macro Filter"},
-    {"agent_id": "agent_13", "name": "Regime Detector"},
-    {"agent_id": "agent_14", "name": "Anomaly Watch"},
-    {"agent_id": "agent_15", "name": "Edge Aggregator"},
-]
-
-BUY_REASONS = [
-    "Edge detected; scenario tailwind supports entry.",
-    "Liquidity acceptable; expected value positive this tick.",
-    "Pricing looks favorable vs. implied probability.",
-    "Momentum aligns; small probe position is justified.",
-]
-HOLD_REASONS = [
-    "Signals conflict; avoid overtrading.",
-    "Spread too wide; wait for better entry.",
-    "No clear edge; preserve capital.",
-    "Regime uncertain; hold until confirmation.",
-]
+def load_presets() -> Dict[str, Any]:
+    try:
+        with open(PRESET_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if "snapshots" not in data or not isinstance(data["snapshots"], list) or len(data["snapshots"]) == 0:
+            raise ValueError("agents_preset.json must contain non-empty snapshots[]")
+        return data
+    except Exception as e:
+        raise RuntimeError(f"Failed to load {PRESET_FILE}: {type(e).__name__}: {e}")
 
 
-def _rand01(seed: int) -> float:
-    x = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-    return (x % 10000) / 10000.0
+PRESETS = load_presets()
 
 
-async def run_agent(agent_idx: int, tick: int, scenario: str) -> Dict[str, Any]:
+def apply_scenario_bias(agents: List[Dict[str, Any]], scenario: str, tick: int) -> List[Dict[str, Any]]:
     """
-    Сейчас агент "фейковый", но:
-    - запускается параллельно
-    - умеет таймаут/ошибку
-    В будущем сюда вставим реальные API вызовы.
+    Чуть “подкручиваем” пресет под сценарий:
+    - bull: иногда переводим HOLD -> BUY (с высокой уверенностью)
+    - bear: иногда переводим BUY -> HOLD
+    Делаем детерминированно от tick, чтобы было воспроизводимо.
     """
-    meta = AGENTS[agent_idx]
-    base_seed = (tick + 1) * 1000 + agent_idx * 97
+    out = []
+    for i, a in enumerate(agents):
+        a2 = dict(a)
+        # нормализуем поля
+        a2.setdefault("status", "ok")
+        a2.setdefault("signals", {})
+        vote = str(a2.get("vote", "HOLD")).upper()
+        conf = float(a2.get("confidence", 0.55))
 
-    # фейковая задержка, чтобы было видно что параллельно
-    # (разные агенты тратят разное время)
-    delay = 0.05 + _rand01(base_seed + 3) * 0.25
-    await asyncio.sleep(delay)
+        # детерминированная “монетка”
+        r = ((tick * 1009 + i * 97) % 100) / 100.0
 
-    r = _rand01(base_seed)
+        if scenario == "bull":
+            # 20% HOLD -> BUY
+            if vote == "HOLD" and r < 0.20:
+                a2["vote"] = "BUY"
+                a2["confidence"] = round(min(conf + 0.10, 0.95), 2)
+                a2["reason"] = (a2.get("reason", "") + " (bull bias)").strip()
+        elif scenario == "bear":
+            # 20% BUY -> HOLD
+            if vote == "BUY" and r < 0.20:
+                a2["vote"] = "HOLD"
+                a2["confidence"] = round(max(conf - 0.10, 0.45), 2)
+                a2["reason"] = (a2.get("reason", "") + " (bear caution)").strip()
+        else:
+            a2["vote"] = vote
 
-    bias = 0.0
-    if scenario == "bull":
-        bias = 0.12
-    elif scenario == "bear":
-        bias = -0.12
-
-    score = r + bias
-    vote = "BUY" if score >= 0.52 else "HOLD"
-    conf = round(min(max(0.45, 0.55 + (score - 0.5)), 0.95), 2)
-
-    reason = BUY_REASONS[int(_rand01(base_seed + 7) * len(BUY_REASONS))] if vote == "BUY" else HOLD_REASONS[int(_rand01(base_seed + 9) * len(HOLD_REASONS))]
-
-    signals = {
-        "price": round(_rand01(base_seed + 11), 3),
-        "implied_prob": round(_rand01(base_seed + 13), 3),
-        "sentiment": round(_rand01(base_seed + 17) * 2 - 1, 3),
-        "volatility": round(_rand01(base_seed + 19), 3),
-    }
-
-    return {
-        "status": "ok",
-        "agent_id": meta["agent_id"],
-        "name": meta["name"],
-        "vote": vote,
-        "confidence": conf,
-        "reason": reason,
-        "signals": signals,
-    }
+        out.append(a2)
+    return out
 
 
 def summarize(agents: List[Dict[str, Any]]) -> Dict[str, Any]:
-    buy = sum(1 for a in agents if a.get("vote") == "BUY")
-    hold = sum(1 for a in agents if a.get("vote") == "HOLD")
+    buy = sum(1 for a in agents if str(a.get("vote", "")).upper() == "BUY")
+    hold = sum(1 for a in agents if str(a.get("vote", "")).upper() == "HOLD")
+    ok_cnt = sum(1 for a in agents if a.get("status") == "ok")
     avg_conf = round(
-        sum(float(a.get("confidence", 0.0)) for a in agents if a.get("status") == "ok") / max(1, sum(1 for a in agents if a.get("status") == "ok")),
+        sum(float(a.get("confidence", 0.0)) for a in agents if a.get("status") == "ok") / max(1, ok_cnt),
         3,
     )
     decision = "BUY" if buy >= 9 else "HOLD"
@@ -315,11 +287,25 @@ def summarize(agents: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def make_digest(agents: List[Dict[str, Any]]) -> Dict[str, Any]:
-    buy_reasons = [a["reason"] for a in agents if a.get("vote") == "BUY"][:3]
+    buy_reasons = [a.get("reason", "") for a in agents if str(a.get("vote", "")).upper() == "BUY"][:3]
     return {
-        "buy_count": sum(1 for a in agents if a.get("vote") == "BUY"),
+        "buy_count": sum(1 for a in agents if str(a.get("vote", "")).upper() == "BUY"),
         "top_buy_reasons": buy_reasons,
     }
+
+
+async def next_snapshot_index() -> int:
+    raw = await safe_get_string(PRESET_INDEX_KEY)
+    try:
+        idx = int(raw) if raw is not None else 0
+    except Exception:
+        idx = 0
+    snap_count = len(PRESETS["snapshots"])
+    idx = idx % snap_count
+    # сохраняем следующий (круговой)
+    next_idx = (idx + 1) % snap_count
+    await safe_set_string(PRESET_INDEX_KEY, str(next_idx))
+    return idx
 
 
 # ----------------------------
@@ -338,7 +324,9 @@ async def healthz():
         "has_kv_url": bool(KV_REST_API_URL),
         "has_kv_token": bool(KV_REST_API_TOKEN),
         "default_market_id": DEFAULT_MARKET_ID,
-        "agent_timeout_sec": AGENT_TIMEOUT_SECONDS,
+        "preset_file": PRESET_FILE,
+        "preset_snapshots": len(PRESETS.get("snapshots", [])),
+        "preset_index_key": PRESET_INDEX_KEY,
     }
 
 
@@ -389,6 +377,7 @@ async def admin_reset(_: bool = Depends(require_auth)):
     keys = [
         LOCK_KEY,
         SCENARIO_KEY,
+        PRESET_INDEX_KEY,
         latest_key(DEFAULT_MARKET_ID),
         history_key(DEFAULT_MARKET_ID),
     ]
@@ -413,32 +402,19 @@ async def run(_: bool = Depends(require_auth)):
         market_id = DEFAULT_MARKET_ID
         tick = int(time.time() // 300)
 
-        # --- ПАРАЛЛЕЛЬНО запускаем 15 агентов ---
-        tasks = []
-        for i in range(len(AGENTS)):
-            coro = run_agent(i, tick, scenario)
-            tasks.append(asyncio.wait_for(coro, timeout=AGENT_TIMEOUT_SECONDS))
+        # берём следующий пресет
+        snap_idx = await next_snapshot_index()
+        snap = PRESETS["snapshots"][snap_idx]
+        agents_raw = snap.get("agents", [])
+        if not isinstance(agents_raw, list) or len(agents_raw) != 15:
+            raise HTTPException(status_code=500, detail="Preset snapshot must contain exactly 15 agents")
 
-        results: List[Dict[str, Any]] = []
-        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        # применяем сценарий
+        agents = apply_scenario_bias(agents_raw, scenario, tick)
 
-        for i, g in enumerate(gathered):
-            meta = AGENTS[i]
-            if isinstance(g, Exception):
-                results.append({
-                    "status": "error",
-                    "agent_id": meta["agent_id"],
-                    "name": meta["name"],
-                    "vote": "HOLD",
-                    "confidence": 0.5,
-                    "reason": f"Agent failed: {type(g).__name__}",
-                    "signals": {},
-                })
-            else:
-                results.append(g)
-
-        summary = summarize(results)
-        digest = make_digest(results)
+        # summary/digest
+        summary = summarize(agents)
+        digest = make_digest(agents)
 
         item = {
             "ts": int(time.time()),
@@ -447,7 +423,7 @@ async def run(_: bool = Depends(require_auth)):
             "scenario": scenario,
             "summary": summary,
             "digest": digest,
-            "agents": results,
+            "agents": agents,
         }
 
         latest_payload = {"ok": True, "market_id": market_id, "data": item}
@@ -485,7 +461,14 @@ async def run(_: bool = Depends(require_auth)):
             pass
 
         duration = round(time.time() - started, 3)
-        return {"ok": True, "skipped": False, "scenario": scenario, "message": "tick executed", "duration_sec": duration}
+        return {
+            "ok": True,
+            "skipped": False,
+            "scenario": scenario,
+            "preset_snapshot": snap_idx,
+            "message": "tick executed (preset)",
+            "duration_sec": duration,
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Executor error: {type(e).__name__}: {e}") from e
