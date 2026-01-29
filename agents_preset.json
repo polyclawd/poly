@@ -1,0 +1,20 @@
+{
+  "market_id": "POLY:DEMO_001",
+  "agents": [
+    { "agent_id": "agent_01", "name": "Market Microstructure" },
+    { "agent_id": "agent_02", "name": "Orderbook Reader" },
+    { "agent_id": "agent_03", "name": "News Synthesizer" },
+    { "agent_id": "agent_04", "name": "Social Sentiment" },
+    { "agent_id": "agent_05", "name": "Volatility Watch" },
+    { "agent_id": "agent_06", "name": "Flow Tracker" },
+    { "agent_id": "agent_07", "name": "Regime Detector" },
+    { "agent_id": "agent_08", "name": "Arb Scanner" },
+    { "agent_id": "agent_09", "name": "Risk Manager" },
+    { "agent_id": "agent_10", "name": "Macro Pulse" },
+    { "agent_id": "agent_11", "name": "Liquidity Guard" },
+    { "agent_id": "agent_12", "name": "Momentum Scout" },
+    { "agent_id": "agent_13", "name": "Mean Reversion" },
+    { "agent_id": "agent_14", "name": "Narrative Miner" },
+    { "agent_id": "agent_15", "name": "Execution Coach" }
+  ]
+}
