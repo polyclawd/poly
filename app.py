@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 
-# ----------------------------
+# ------------------------ddd----
 # Config
 # ----------------------------
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "executor-secret-polyclawd-2026")
@@ -32,6 +32,8 @@ MARKETS = os.getenv("MARKETS", "POLY:DEMO_001,POLY:DEMO_002,POLY:DEMO_003,POLY:D
 SCENARIO_KEY = os.getenv("SCENARIO_KEY", "executor:scenario")
 PORTFOLIO_KEY = os.getenv("PORTFOLIO_KEY", "executor:portfolio")
 HISTORY_PREFIX = os.getenv("HISTORY_PREFIX", "executor:history:")
+PRESETS_KEY = os.getenv("PRESETS_KEY", "executor:presets")
+AGENTS_PRESET_JSON = os.getenv("AGENTS_PRESET_JSON", "")
 
 
 # ----------------------------
@@ -200,12 +202,20 @@ def portfolio_value(p: Dict[str, Any]) -> float:
 
 
 # ----------------------------
-# Fake agents decision (preset-like)
-# IMPORTANT: у тебя уже есть свои пресеты — этот блок оставь как совместимый интерфейс.
-# Тут мы делаем детерминированный "анализ" на основе scenario+market_id+tick.
+# Presets (optional)
+# Structure expected (JSON):
+# {
+#   "bull": {
+#     "POLY:DEMO_001": [ {"agents": [...]} , {"agents": [...]} , ... ],
+#     "POLY:DEMO_002": [ ... ]
+#   },
+#   "bear": { ... },
+#   "neutral": { ... }
+# }
+# Each entry in the list is a "frame" that can be rotated by tick.
+# If a scenario/market is missing, we fall back to deterministic fake agents.
 # ----------------------------
 AGENT_COUNT = 15
-
 
 def _seed_int(s: str) -> int:
     # простой детерминированный seed
@@ -213,7 +223,6 @@ def _seed_int(s: str) -> int:
     for ch in s:
         x = (x * 131 + ord(ch)) % 1_000_000_007
     return x
-
 
 def _agent_vote(seed: int) -> Tuple[str, float, str]:
     # vote, confidence, reason
@@ -226,7 +235,150 @@ def _agent_vote(seed: int) -> Tuple[str, float, str]:
     return "HOLD", 0.50 + abs(r - 0.5), "Signals conflict; avoid overtrading."
 
 
-def run_agents_for_market(market_id: str, scenario: str, tick: int) -> Dict[str, Any]:
+# ----------------------------
+# Presets (optional)
+# Structure expected (JSON):
+# {
+#   "bull": {
+#     "POLY:DEMO_001": [ {"agents": [...]} , {"agents": [...]} , ... ],
+#     "POLY:DEMO_002": [ ... ]
+#   },
+#   "bear": { ... },
+#   "neutral": { ... }
+# }
+# Each entry in the list is a "frame" that can be rotated by tick.
+# If a scenario/market is missing, we fall back to deterministic fake agents.
+# ----------------------------
+
+def _safe_json_loads(s: Optional[str]) -> Optional[Any]:
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+async def load_presets() -> Optional[Dict[str, Any]]:
+    """Load presets from Upstash first; if empty, fall back to env var."""
+    # 1) Upstash
+    try:
+        raw = await upstash_get(PRESETS_KEY)
+    except Exception:
+        raw = None
+    presets = _safe_json_loads(raw)
+    if isinstance(presets, dict) and presets:
+        return presets
+
+    # 2) Env var fallback
+    presets = _safe_json_loads(AGENTS_PRESET_JSON)
+    if isinstance(presets, dict) and presets:
+        return presets
+
+    return None
+
+
+def _summarize_from_agents(agents: List[Dict[str, Any]]) -> Dict[str, Any]:
+    buy = sum(1 for a in agents if str(a.get("vote", "")).upper() == "BUY")
+    sell = sum(1 for a in agents if str(a.get("vote", "")).upper() == "SELL")
+    hold = sum(1 for a in agents if str(a.get("vote", "")).upper() == "HOLD")
+
+    confs = []
+    for a in agents:
+        try:
+            confs.append(float(a.get("confidence", 0)))
+        except Exception:
+            pass
+    avg_conf = round(sum(confs) / len(confs), 3) if confs else 0.0
+
+    decision = "HOLD"
+    if buy >= 9:
+        decision = "BUY"
+    if sell >= 9:
+        decision = "SELL"
+
+    return {
+        "decision": decision,
+        "buy_count": buy,
+        "hold_count": hold,
+        "sell_count": sell,
+        "avg_confidence": avg_conf,
+        "rule": "BUY if buy_count >= 9; SELL if sell_count >= 9; else HOLD",
+    }
+
+
+def _digest_from_agents(agents: List[Dict[str, Any]]) -> Dict[str, Any]:
+    buy_reasons = [a.get("reason") for a in agents if str(a.get("vote", "")).upper() == "BUY" and a.get("reason")]
+    return {
+        "buy_count": sum(1 for a in agents if str(a.get("vote", "")).upper() == "BUY"),
+        "top_buy_reasons": buy_reasons[:3],
+    }
+
+
+def _normalize_agents(agents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Ensure each agent has required fields; keep any extra fields (signals, etc.)."""
+    out = []
+    for i, a in enumerate(agents, start=1):
+        if not isinstance(a, dict):
+            continue
+        agent_id = a.get("agent_id") or f"agent_{i:02d}"
+        name = a.get("name") or f"Agent {i:02d}"
+        vote = str(a.get("vote", "HOLD")).upper()
+        if vote not in {"BUY", "HOLD", "SELL"}:
+            vote = "HOLD"
+        try:
+            confidence = float(a.get("confidence", 0.5))
+        except Exception:
+            confidence = 0.5
+        reason = a.get("reason") or ""
+
+        # Preserve any extra keys (e.g., signals)
+        merged = dict(a)
+        merged.update({
+            "agent_id": agent_id,
+            "name": name,
+            "vote": vote,
+            "confidence": round(confidence, 3),
+            "reason": reason,
+        })
+        out.append(merged)
+
+    # If fewer than AGENT_COUNT, pad deterministically
+    if len(out) < AGENT_COUNT:
+        for j in range(len(out) + 1, AGENT_COUNT + 1):
+            out.append({
+                "agent_id": f"agent_{j:02d}",
+                "name": f"Agent {j:02d}",
+                "vote": "HOLD",
+                "confidence": 0.5,
+                "reason": "(preset missing)"
+            })
+
+    # If more than AGENT_COUNT, trim
+    return out[:AGENT_COUNT]
+
+
+def run_agents_for_market(market_id: str, scenario: str, tick: int, presets: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    # 0) If presets available, try to use them
+    if isinstance(presets, dict):
+        scen = presets.get(scenario) or presets.get("default") or {}
+        if isinstance(scen, dict):
+            frames = scen.get(market_id)
+            if isinstance(frames, list) and frames:
+                frame = frames[tick % len(frames)]
+                if isinstance(frame, dict) and isinstance(frame.get("agents"), list):
+                    agents = _normalize_agents(frame["agents"])
+                    summary = _summarize_from_agents(agents)
+                    digest = _digest_from_agents(agents)
+                    return {
+                        "market_id": market_id,
+                        "scenario": scenario,
+                        "summary": summary,
+                        "agents": agents,
+                        "digest": digest,
+                    }
+
+    # 1) Fallback: deterministic fake agents (previous behavior)
     agents = []
     buy_count = hold_count = sell_count = 0
     confs = []
@@ -261,7 +413,6 @@ def run_agents_for_market(market_id: str, scenario: str, tick: int) -> Dict[str,
 
     avg_conf = round(sum(confs) / len(confs), 3)
 
-    # decision rule (можешь потом менять)
     decision = "HOLD"
     if buy_count >= 9:
         decision = "BUY"
@@ -283,7 +434,7 @@ def run_agents_for_market(market_id: str, scenario: str, tick: int) -> Dict[str,
         "digest": {
             "buy_count": buy_count,
             "top_buy_reasons": [a["reason"] for a in agents if a["vote"] == "BUY"][:3],
-        }
+        },
     }
 
 
@@ -390,10 +541,33 @@ async def admin_reset(_: bool = Depends(require_auth)):
     deleted = []
     deleted.append(await upstash_del(PORTFOLIO_KEY))
     deleted.append(await upstash_del(SCENARIO_KEY))
+    deleted.append(await upstash_del(PRESETS_KEY))
     for m in MARKETS:
         deleted.append(await upstash_del(f"{HISTORY_PREFIX}{m}"))
     deleted.append(await upstash_del(LOCK_KEY))
     return {"ok": True, "deleted": deleted}
+
+
+
+@app.get("/admin/presets")
+async def admin_presets_get(_: bool = Depends(require_auth)):
+    raw = await upstash_get(PRESETS_KEY)
+    presets = _safe_json_loads(raw)
+    return {"ok": True, "key": PRESETS_KEY, "has_presets": bool(presets), "presets": presets}
+
+
+@app.post("/admin/presets")
+async def admin_presets_post(body: Dict[str, Any], _: bool = Depends(require_auth)):
+    # Accept either {"presets": {...}} or the presets object directly
+    presets_obj = body.get("presets") if isinstance(body, dict) else None
+    if presets_obj is None:
+        presets_obj = body
+
+    if not isinstance(presets_obj, dict):
+        raise HTTPException(status_code=422, detail="Invalid presets payload: expected JSON object")
+
+    await upstash_set(PRESETS_KEY, json.dumps(presets_obj))
+    return {"ok": True, "key": PRESETS_KEY}
 
 
 @app.post("/run")
@@ -405,6 +579,7 @@ async def run(_: bool = Depends(require_auth)):
 
     try:
         scenario = await get_scenario()
+        presets = await load_presets()
         p = await load_portfolio()
         pv = portfolio_value(p)
 
@@ -414,7 +589,7 @@ async def run(_: bool = Depends(require_auth)):
         # 1) analyze all markets
         analyses = []
         for market_id in MARKETS:
-            analyses.append(run_agents_for_market(market_id, scenario, tick))
+            analyses.append(run_agents_for_market(market_id, scenario, tick, presets=presets))
 
         # 2) close positions where SELL
         positions: Dict[str, Any] = p.get("positions", {}) or {}
