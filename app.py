@@ -23,6 +23,7 @@ LOCK_TTL_SECONDS = int(os.getenv("EXECUTOR_LOCK_TTL_SECONDS", "60"))
 # trading demo settings
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
 MAX_TRADE_FRACTION = float(os.getenv("MAX_TRADE_FRACTION", "0.10"))  # 10% of portfolio value
+EXIT_CONFIDENCE_THRESHOLD = float(os.getenv("EXIT_CONFIDENCE_THRESHOLD", "0.55"))
 STARTING_CASH = float(os.getenv("STARTING_CASH", "250"))
 
 # demo markets
@@ -591,14 +592,22 @@ async def run(_: bool = Depends(require_auth)):
         for market_id in MARKETS:
             analyses.append(run_agents_for_market(market_id, scenario, tick, presets=presets))
 
-        # 2) close positions where SELL
+        # 2) close positions where SELL or confidence drops
         positions: Dict[str, Any] = p.get("positions", {}) or {}
         cash = float(p.get("cash", 0.0))
 
-        for a in analyses:
-            mid = a["market_id"]
-            decision = a["summary"]["decision"]
-            if mid in positions and decision == "SELL":
+        # map market -> analysis for quick access
+        analysis_by_market = {a["market_id"]: a for a in analyses}
+
+        for mid in list(positions.keys()):
+            a = analysis_by_market.get(mid)
+            if not a:
+                continue
+
+            decision = a["summary"].get("decision")
+            avg_conf = float(a["summary"].get("avg_confidence", 0))
+
+            if decision == "SELL" or avg_conf <= EXIT_CONFIDENCE_THRESHOLD:
                 qty = float(positions[mid].get("qty_usd", 0))
                 cash += qty
                 del positions[mid]
@@ -643,6 +652,11 @@ async def run(_: bool = Depends(require_auth)):
                 "scenario": scenario,
                 "summary": a["summary"],
                 "digest": a["digest"],
+                "execution": {
+                    "in_position": mid in p.get("positions", {}),
+                    "decision": a["summary"].get("decision"),
+                    "avg_confidence": a["summary"].get("avg_confidence"),
+                },
                 "portfolio": {
                     "value": round(portfolio_value(p), 2),
                     "cash": p["cash"],
