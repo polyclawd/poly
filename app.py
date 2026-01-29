@@ -736,7 +736,7 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             was_in_position = mid in positions_before
             is_in_position = mid in positions_after
 
-            # INTENT: what the strategy wanted to do
+            # INTENT: what the strategy wanted to do (separate from what actually happened)
             if was_in_position:
                 if decision == "SELL" or avg_conf <= EXIT_CONFIDENCE_THRESHOLD:
                     intent = "EXIT"
@@ -747,6 +747,9 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             else:
                 if decision == "BUY":
                     intent = "OPEN"
+                elif decision == "SELL":
+                    # can't sell if we have no position; surface this clearly to UI
+                    intent = "IGNORE"
                 else:
                     intent = "HOLD"
 
@@ -771,6 +774,16 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
                 elif intent == "EXIT" and was_in_position and is_in_position:
                     action = "NONE"
                     reason = "exit conditions not met"
+                # Ensure UI always gets a meaningful explanation when nothing happens
+                if action == "NONE" and not reason:
+                    if decision == "SELL" and not was_in_position:
+                        reason = "not in position"
+                    elif intent == "HOLD":
+                        reason = "no action"
+                    elif intent == "OPEN":
+                        reason = open_skip_reason.get(mid, "not opened")
+                    else:
+                        reason = "no action"
 
             return {
                 "in_position": is_in_position,
