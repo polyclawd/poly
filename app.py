@@ -14,8 +14,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # Config
 # ----------------------------
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "executor-secret-polyclawd-2026")
-KV_REST_API_URL = os.getenv("KV_REST_API_URL", "").rstrip("/")
-KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "")
+KV_REST_API_URL = os.getenv("KV_REST_API_URL", "https://thankful-bluegill-32910.upstash.io").rstrip("/")
+KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "AYCOAAIncDI5OTM2N2MzOTBiNGE0NzJjODhjZTZjZWQzNzBjMDI5MXAyMzI5MTA")
 
 LOCK_KEY = os.getenv("EXECUTOR_LOCK_KEY", "executor:lock")
 LOCK_TTL_SECONDS = int(os.getenv("EXECUTOR_LOCK_TTL_SECONDS", "60"))
