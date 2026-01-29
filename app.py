@@ -15,9 +15,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # ----------------------------
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "executor-secret-polyclawd-2026")
 
-KV_REST_API_URL = os.getenv("KV_REST_API_URL", "https://thankful-bluegill-32910.upstash.io").rstrip("/")
-KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "AYCOAAIncDI5OTM2N2MzOTBiNGE0NzJjODhjZTZjZWQzNzBjMDI5MXAyMzI5MTA")
-KV_REST_API_READ_ONLY_TOKEN = os.getenv("KV_REST_API_READ_ONLY_TOKEN", "")
+KV_REST_API_URL = os.getenv("KV_REST_API_URL", "").rstrip("/")
+KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "")
 
 LOCK_KEY = os.getenv("EXECUTOR_LOCK_KEY", "executor:lock")
 LOCK_TTL_SECONDS = int(os.getenv("EXECUTOR_LOCK_TTL_SECONDS", "60"))
@@ -29,7 +28,7 @@ DEFAULT_SCENARIO = os.getenv("DEFAULT_SCENARIO", "neutral")
 ALLOWED_SCENARIOS = ["neutral", "bull", "bear"]
 
 HISTORY_TTL_SECONDS = int(os.getenv("EXECUTOR_HISTORY_TTL_SECONDS", "3600"))  # 1 час
-HISTORY_MAX_ITEMS = int(os.getenv("EXECUTOR_HISTORY_MAX_ITEMS", "120"))       # ограничим размер
+HISTORY_MAX_ITEMS = int(os.getenv("EXECUTOR_HISTORY_MAX_ITEMS", "120"))
 
 HTTP_TIMEOUT = float(os.getenv("EXECUTOR_HTTP_TIMEOUT", "12"))
 
@@ -72,15 +71,17 @@ def _upstash_headers(token: str) -> Dict[str, str]:
 
 
 def _clean(s: str) -> str:
-    # убираем переносы/пробелы/случайные кавычки
     if s is None:
         return ""
     return str(s).strip().strip('"').strip("'")
 
 
 def _enc(s: str) -> str:
-    # ВАЖНО: безопасно кодируем для path-сегментов
     return quote(_clean(s), safe="")
+
+
+class UpstashWrongType(Exception):
+    pass
 
 
 async def _upstash_request(method: str, path: str, token: str) -> Dict[str, Any]:
@@ -94,16 +95,18 @@ async def _upstash_request(method: str, path: str, token: str) -> Dict[str, Any]
     if r.status_code == 401:
         raise HTTPException(status_code=500, detail="Upstash 401 Unauthorized: check KV_REST_API_TOKEN")
 
-    # Чтобы видеть причину 400 в ответе сервера
     if r.status_code >= 400:
-        raise HTTPException(status_code=500, detail=f"Upstash error {r.status_code}: {r.text}")
+        txt = r.text or ""
+        # Upstash иногда отдаёт {"error":"WRONGTYPE ..."}
+        if "WRONGTYPE" in txt:
+            raise UpstashWrongType(txt)
+        raise HTTPException(status_code=500, detail=f"Upstash error {r.status_code}: {txt}")
 
     return r.json()
 
 
 async def upstash_get(key: str, token: str) -> Optional[str]:
     data = await _upstash_request("GET", f"get/{_enc(key)}", token)
-    # {"result": "..."} or {"result": null}
     res = data.get("result", None)
     if res is None:
         return None
@@ -111,7 +114,6 @@ async def upstash_get(key: str, token: str) -> Optional[str]:
 
 
 async def upstash_set(key: str, value: str, token: str) -> None:
-    # /set/<key>/<value>
     await _upstash_request("POST", f"set/{_enc(key)}/{_enc(value)}", token)
 
 
@@ -125,8 +127,46 @@ async def upstash_setnx(key: str, value: str, token: str) -> int:
 
 
 async def upstash_expire(key: str, seconds: int, token: str) -> None:
-    # /expire/<key>/<seconds>
     await _upstash_request("POST", f"expire/{_enc(key)}/{int(seconds)}", token)
+
+
+# ----------------------------
+# “Safe” wrappers that auto-heal WRONGTYPE by deleting the key once
+# ----------------------------
+async def safe_get_string(key: str) -> Optional[str]:
+    try:
+        return await upstash_get(key, KV_REST_API_TOKEN)
+    except UpstashWrongType:
+        # ключ был не строкой — удаляем и считаем “пустым”
+        await upstash_del(key, KV_REST_API_TOKEN)
+        return None
+
+
+async def safe_set_string(key: str, value: str) -> None:
+    try:
+        await upstash_set(key, value, KV_REST_API_TOKEN)
+    except UpstashWrongType:
+        await upstash_del(key, KV_REST_API_TOKEN)
+        await upstash_set(key, value, KV_REST_API_TOKEN)
+
+
+async def safe_setnx_string(key: str, value: str) -> int:
+    try:
+        return await upstash_setnx(key, value, KV_REST_API_TOKEN)
+    except UpstashWrongType:
+        await upstash_del(key, KV_REST_API_TOKEN)
+        return await upstash_setnx(key, value, KV_REST_API_TOKEN)
+
+
+# ----------------------------
+# Keys
+# ----------------------------
+def latest_key(market_id: str) -> str:
+    return f"executor:latest:{_clean(market_id)}"
+
+
+def history_key(market_id: str) -> str:
+    return f"executor:history:{_clean(market_id)}"
 
 
 # ----------------------------
@@ -134,9 +174,8 @@ async def upstash_expire(key: str, seconds: int, token: str) -> None:
 # ----------------------------
 async def try_lock() -> Optional[str]:
     lock_id = str(uuid.uuid4())
-    ok = await upstash_setnx(LOCK_KEY, lock_id, KV_REST_API_TOKEN)
+    ok = await safe_setnx_string(LOCK_KEY, lock_id)
     if ok == 1:
-        # ставим TTL, чтобы не словить вечный лок
         try:
             await upstash_expire(LOCK_KEY, LOCK_TTL_SECONDS, KV_REST_API_TOKEN)
         except Exception:
@@ -153,15 +192,12 @@ async def unlock() -> None:
 
 
 # ----------------------------
-# Scenario storage
+# Scenario
 # ----------------------------
 async def get_scenario() -> str:
-    try:
-        raw = await upstash_get(SCENARIO_KEY, KV_REST_API_TOKEN)
-        if raw and raw in ALLOWED_SCENARIOS:
-            return raw
-    except Exception:
-        pass
+    raw = await safe_get_string(SCENARIO_KEY)
+    if raw and raw in ALLOWED_SCENARIOS:
+        return raw
     return DEFAULT_SCENARIO
 
 
@@ -169,7 +205,7 @@ async def set_scenario(s: str) -> str:
     s = _clean(s).lower()
     if s not in ALLOWED_SCENARIOS:
         raise HTTPException(status_code=422, detail=f"scenario must be one of {ALLOWED_SCENARIOS}")
-    await upstash_set(SCENARIO_KEY, s, KV_REST_API_TOKEN)
+    await safe_set_string(SCENARIO_KEY, s)
     return s
 
 
@@ -209,7 +245,6 @@ HOLD_REASONS = [
 
 
 def _rand01(seed: int) -> float:
-    # детерминированный "random"
     x = (seed * 1103515245 + 12345) & 0x7FFFFFFF
     return (x % 10000) / 10000.0
 
@@ -218,7 +253,6 @@ def fake_agent_vote(agent_idx: int, tick: int, scenario: str) -> Dict[str, Any]:
     base_seed = (tick + 1) * 1000 + agent_idx * 97
     r = _rand01(base_seed)
 
-    # bias от сценария
     bias = 0.0
     if scenario == "bull":
         bias = 0.12
@@ -272,17 +306,6 @@ def make_digest(agents: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Storage keys
-# ----------------------------
-def latest_key(market_id: str) -> str:
-    return f"executor:latest:{_clean(market_id)}"
-
-
-def history_key(market_id: str) -> str:
-    return f"executor:history:{_clean(market_id)}"
-
-
-# ----------------------------
 # Routes
 # ----------------------------
 @app.get("/")
@@ -319,7 +342,7 @@ async def scenario_post(body: Dict[str, Any], _: bool = Depends(require_auth)):
 @app.get("/public/latest/{market_id}")
 async def public_latest(market_id: str):
     k = latest_key(market_id)
-    raw = await upstash_get(k, KV_REST_API_TOKEN)
+    raw = await safe_get_string(k)
     if not raw:
         return {"ok": False, "market_id": market_id, "error": "no data yet"}
     try:
@@ -331,7 +354,7 @@ async def public_latest(market_id: str):
 @app.get("/public/history/{market_id}")
 async def public_history(market_id: str):
     k = history_key(market_id)
-    raw = await upstash_get(k, KV_REST_API_TOKEN)
+    raw = await safe_get_string(k)
     if not raw:
         return {"ok": True, "market_id": market_id, "items": []}
     try:
@@ -341,6 +364,23 @@ async def public_history(market_id: str):
         return {"ok": True, "market_id": market_id, "items": items}
     except Exception:
         return {"ok": True, "market_id": market_id, "items": []}
+
+
+@app.post("/admin/reset")
+async def admin_reset(_: bool = Depends(require_auth)):
+    # Удаляем ключи, которые чаще всего ломаются типом
+    keys = [
+        LOCK_KEY,
+        SCENARIO_KEY,
+        latest_key(DEFAULT_MARKET_ID),
+        history_key(DEFAULT_MARKET_ID),
+    ]
+    for k in keys:
+        try:
+            await upstash_del(k, KV_REST_API_TOKEN)
+        except Exception:
+            pass
+    return {"ok": True, "deleted": keys}
 
 
 @app.post("/run")
@@ -355,7 +395,6 @@ async def run(_: bool = Depends(require_auth)):
         scenario = await get_scenario()
         market_id = DEFAULT_MARKET_ID
 
-        # tick делаем монотонным (секунды // 300)
         tick = int(time.time() // 300)
 
         agents = [fake_agent_vote(i, tick, scenario) for i in range(len(AGENTS))]
@@ -378,13 +417,17 @@ async def run(_: bool = Depends(require_auth)):
             "data": item,
         }
 
-        # latest
-        await upstash_set(latest_key(market_id), json.dumps(latest_payload, ensure_ascii=False), KV_REST_API_TOKEN)
-        await upstash_expire(latest_key(market_id), HISTORY_TTL_SECONDS, KV_REST_API_TOKEN)
+        # latest (string)
+        lk = latest_key(market_id)
+        await safe_set_string(lk, json.dumps(latest_payload, ensure_ascii=False))
+        try:
+            await upstash_expire(lk, HISTORY_TTL_SECONDS, KV_REST_API_TOKEN)
+        except Exception:
+            pass
 
-        # history
+        # history (string with JSON list)
         hk = history_key(market_id)
-        raw_hist = await upstash_get(hk, KV_REST_API_TOKEN)
+        raw_hist = await safe_get_string(hk)
         hist: List[Dict[str, Any]] = []
         if raw_hist:
             try:
@@ -394,19 +437,19 @@ async def run(_: bool = Depends(require_auth)):
             except Exception:
                 hist = []
 
-        # добавляем новый item в конец (как у тебя сейчас)
         hist.append(item)
 
-        # режем по времени (последний час)
         cutoff = int(time.time()) - HISTORY_TTL_SECONDS
         hist = [x for x in hist if int(x.get("ts", 0)) >= cutoff]
 
-        # режем по количеству
         if len(hist) > HISTORY_MAX_ITEMS:
             hist = hist[-HISTORY_MAX_ITEMS:]
 
-        await upstash_set(hk, json.dumps(hist, ensure_ascii=False), KV_REST_API_TOKEN)
-        await upstash_expire(hk, HISTORY_TTL_SECONDS, KV_REST_API_TOKEN)
+        await safe_set_string(hk, json.dumps(hist, ensure_ascii=False))
+        try:
+            await upstash_expire(hk, HISTORY_TTL_SECONDS, KV_REST_API_TOKEN)
+        except Exception:
+            pass
 
         duration = round(time.time() - started, 3)
         return {"ok": True, "skipped": False, "scenario": scenario, "message": "tick executed", "duration_sec": duration}
