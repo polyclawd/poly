@@ -9,17 +9,11 @@ jobs:
   run-executor:
     runs-on: ubuntu-latest
     steps:
-      - name: Call executor /run
-        run: |
-          echo "Calling: $EXECUTOR_URL"
-          curl -sS -X POST "$EXECUTOR_URL" \
-            -H "Authorization: Bearer $EXECUTOR_SECRET" \
-            -H "Content-Type: application/json" \
-            --data '{}' \
-            | tee response.json
-          echo ""
-          echo "Done. Response:"
-          cat response.json
+      - name: Call executor /cron/run
         env:
-          EXECUTOR_URL: ${{ secrets.EXECUTOR_URL }}
           EXECUTOR_SECRET: ${{ secrets.EXECUTOR_SECRET }}
+        run: |
+          set -euo pipefail
+          curl -sS -f "https://poly-lm6c.onrender.com/cron/run?token=${EXECUTOR_SECRET}" | tee response.json
+          echo ""
+          cat response.json
