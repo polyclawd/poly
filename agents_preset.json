@@ -1,20 +1,62 @@
 {
   "market_id": "POLY:DEMO_001",
-  "agents": [
-    { "agent_id": "agent_01", "name": "Market Microstructure" },
-    { "agent_id": "agent_02", "name": "Orderbook Reader" },
-    { "agent_id": "agent_03", "name": "News Synthesizer" },
-    { "agent_id": "agent_04", "name": "Social Sentiment" },
-    { "agent_id": "agent_05", "name": "Volatility Watch" },
-    { "agent_id": "agent_06", "name": "Flow Tracker" },
-    { "agent_id": "agent_07", "name": "Regime Detector" },
-    { "agent_id": "agent_08", "name": "Arb Scanner" },
-    { "agent_id": "agent_09", "name": "Risk Manager" },
-    { "agent_id": "agent_10", "name": "Macro Pulse" },
-    { "agent_id": "agent_11", "name": "Liquidity Guard" },
-    { "agent_id": "agent_12", "name": "Momentum Scout" },
-    { "agent_id": "agent_13", "name": "Mean Reversion" },
-    { "agent_id": "agent_14", "name": "Narrative Miner" },
-    { "agent_id": "agent_15", "name": "Execution Coach" }
+  "snapshots": [
+    {
+      "agents": [
+        {"agent_id":"agent_01","name":"Market Microstructure","vote":"BUY","confidence":0.70,"reason":"Edge detected; scenario tailwind supports entry.","signals":{"price":0.424,"implied_prob":0.637,"sentiment":-0.994,"volatility":0.241}},
+        {"agent_id":"agent_02","name":"Orderbook Reader","vote":"BUY","confidence":0.85,"reason":"Liquidity acceptable; expected value positive this tick.","signals":{"price":0.415,"implied_prob":0.505,"sentiment":-0.948,"volatility":0.282}},
+        {"agent_id":"agent_03","name":"News Synthesizer","vote":"HOLD","confidence":0.52,"reason":"Signals conflict; avoid overtrading.","signals":{"price":0.364,"implied_prob":0.709,"sentiment":0.157,"volatility":0.407}},
+        {"agent_id":"agent_04","name":"Social Sentiment","vote":"BUY","confidence":0.74,"reason":"Momentum aligns; small probe position is justified.","signals":{"price":0.513,"implied_prob":0.544,"sentiment":0.331,"volatility":0.318}},
+        {"agent_id":"agent_05","name":"Volatility Monitor","vote":"HOLD","confidence":0.58,"reason":"Regime uncertain; hold until confirmation.","signals":{"price":0.291,"implied_prob":0.402,"sentiment":-0.122,"volatility":0.811}},
+        {"agent_id":"agent_06","name":"Flow Tracker","vote":"BUY","confidence":0.69,"reason":"Pricing looks favorable vs. implied probability.","signals":{"price":0.612,"implied_prob":0.772,"sentiment":0.090,"volatility":0.266}},
+        {"agent_id":"agent_07","name":"Liquidity Scout","vote":"BUY","confidence":0.66,"reason":"Liquidity acceptable; expected value positive this tick.","signals":{"price":0.477,"implied_prob":0.529,"sentiment":-0.280,"volatility":0.402}},
+        {"agent_id":"agent_08","name":"Contrarian","vote":"HOLD","confidence":0.55,"reason":"No clear edge; preserve capital.","signals":{"price":0.388,"implied_prob":0.410,"sentiment":-0.611,"volatility":0.499}},
+        {"agent_id":"agent_09","name":"Momentum","vote":"BUY","confidence":0.71,"reason":"Momentum aligns; small probe position is justified.","signals":{"price":0.541,"implied_prob":0.603,"sentiment":0.210,"volatility":0.355}},
+        {"agent_id":"agent_10","name":"Mean Reversion","vote":"HOLD","confidence":0.57,"reason":"Spread too wide; wait for better entry.","signals":{"price":0.250,"implied_prob":0.333,"sentiment":-0.050,"volatility":0.622}},
+        {"agent_id":"agent_11","name":"Risk Manager","vote":"BUY","confidence":0.64,"reason":"Risk acceptable within limits.","signals":{"price":0.481,"implied_prob":0.501,"sentiment":-0.101,"volatility":0.290}},
+        {"agent_id":"agent_12","name":"Macro Filter","vote":"BUY","confidence":0.60,"reason":"Macro neutral; no headwind to entry.","signals":{"price":0.450,"implied_prob":0.480,"sentiment":-0.020,"volatility":0.310}},
+        {"agent_id":"agent_13","name":"Regime Detector","vote":"BUY","confidence":0.67,"reason":"Regime stable; trend-follow works.","signals":{"price":0.520,"implied_prob":0.600,"sentiment":0.120,"volatility":0.280}},
+        {"agent_id":"agent_14","name":"Anomaly Watch","vote":"BUY","confidence":0.62,"reason":"No anomalies blocking entry.","signals":{"price":0.498,"implied_prob":0.515,"sentiment":0.040,"volatility":0.260}},
+        {"agent_id":"agent_15","name":"Edge Aggregator","vote":"BUY","confidence":0.68,"reason":"Composite edge positive.","signals":{"price":0.530,"implied_prob":0.610,"sentiment":0.080,"volatility":0.300}}
+      ]
+    },
+    {
+      "agents": [
+        {"agent_id":"agent_01","name":"Market Microstructure","vote":"HOLD","confidence":0.58,"reason":"Spread too wide; wait for better entry.","signals":{"price":0.312,"implied_prob":0.401,"sentiment":-0.301,"volatility":0.540}},
+        {"agent_id":"agent_02","name":"Orderbook Reader","vote":"BUY","confidence":0.74,"reason":"Liquidity acceptable; expected value positive this tick.","signals":{"price":0.463,"implied_prob":0.522,"sentiment":-0.188,"volatility":0.320}},
+        {"agent_id":"agent_03","name":"News Synthesizer","vote":"BUY","confidence":0.73,"reason":"Market drift aligns with scenario; expected value positive on this tick.","signals":{"price":0.791,"implied_prob":0.886,"sentiment":-0.283,"volatility":0.414}},
+        {"agent_id":"agent_04","name":"Social Sentiment","vote":"HOLD","confidence":0.55,"reason":"Signals conflict; avoid overtrading.","signals":{"price":0.403,"implied_prob":0.466,"sentiment":0.020,"volatility":0.450}},
+        {"agent_id":"agent_05","name":"Volatility Monitor","vote":"BUY","confidence":0.63,"reason":"Volatility acceptable for entry.","signals":{"price":0.501,"implied_prob":0.560,"sentiment":-0.090,"volatility":0.390}},
+        {"agent_id":"agent_06","name":"Flow Tracker","vote":"BUY","confidence":0.66,"reason":"Flow supports entry.","signals":{"price":0.522,"implied_prob":0.580,"sentiment":0.050,"volatility":0.310}},
+        {"agent_id":"agent_07","name":"Liquidity Scout","vote":"HOLD","confidence":0.54,"reason":"No clear edge; preserve capital.","signals":{"price":0.410,"implied_prob":0.440,"sentiment":-0.140,"volatility":0.520}},
+        {"agent_id":"agent_08","name":"Contrarian","vote":"BUY","confidence":0.61,"reason":"Crowd positioning offers upside.","signals":{"price":0.470,"implied_prob":0.510,"sentiment":-0.500,"volatility":0.370}},
+        {"agent_id":"agent_09","name":"Momentum","vote":"BUY","confidence":0.77,"reason":"Momentum aligns; small probe position is justified.","signals":{"price":0.601,"implied_prob":0.650,"sentiment":0.210,"volatility":0.290}},
+        {"agent_id":"agent_10","name":"Mean Reversion","vote":"HOLD","confidence":0.56,"reason":"Regime uncertain; hold until confirmation.","signals":{"price":0.355,"implied_prob":0.390,"sentiment":-0.040,"volatility":0.610}},
+        {"agent_id":"agent_11","name":"Risk Manager","vote":"HOLD","confidence":0.57,"reason":"Risk budget tight; wait.","signals":{"price":0.420,"implied_prob":0.430,"sentiment":0.000,"volatility":0.480}},
+        {"agent_id":"agent_12","name":"Macro Filter","vote":"BUY","confidence":0.62,"reason":"Macro supportive.","signals":{"price":0.510,"implied_prob":0.570,"sentiment":0.060,"volatility":0.300}},
+        {"agent_id":"agent_13","name":"Regime Detector","vote":"BUY","confidence":0.64,"reason":"Regime stable; trend-follow works.","signals":{"price":0.540,"implied_prob":0.610,"sentiment":0.080,"volatility":0.280}},
+        {"agent_id":"agent_14","name":"Anomaly Watch","vote":"HOLD","confidence":0.53,"reason":"Minor anomaly; pause.","signals":{"price":0.390,"implied_prob":0.420,"sentiment":-0.020,"volatility":0.700}},
+        {"agent_id":"agent_15","name":"Edge Aggregator","vote":"BUY","confidence":0.65,"reason":"Composite edge positive.","signals":{"price":0.520,"implied_prob":0.590,"sentiment":0.040,"volatility":0.310}}
+      ]
+    },
+    {
+      "agents": [
+        {"agent_id":"agent_01","name":"Market Microstructure","vote":"HOLD","confidence":0.60,"reason":"No clear edge; preserve capital.","signals":{"price":0.380,"implied_prob":0.420,"sentiment":-0.150,"volatility":0.520}},
+        {"agent_id":"agent_02","name":"Orderbook Reader","vote":"HOLD","confidence":0.58,"reason":"Spread too wide; wait for better entry.","signals":{"price":0.300,"implied_prob":0.350,"sentiment":-0.200,"volatility":0.610}},
+        {"agent_id":"agent_03","name":"News Synthesizer","vote":"HOLD","confidence":0.56,"reason":"Signals conflict; avoid overtrading.","signals":{"price":0.410,"implied_prob":0.460,"sentiment":0.100,"volatility":0.450}},
+        {"agent_id":"agent_04","name":"Social Sentiment","vote":"BUY","confidence":0.62,"reason":"Sentiment improving; small upside.","signals":{"price":0.520,"implied_prob":0.580,"sentiment":0.330,"volatility":0.300}},
+        {"agent_id":"agent_05","name":"Volatility Monitor","vote":"HOLD","confidence":0.55,"reason":"Regime uncertain; hold until confirmation.","signals":{"price":0.290,"implied_prob":0.340,"sentiment":-0.050,"volatility":0.750}},
+        {"agent_id":"agent_06","name":"Flow Tracker","vote":"HOLD","confidence":0.57,"reason":"Flow mixed; avoid overtrading.","signals":{"price":0.420,"implied_prob":0.470,"sentiment":0.020,"volatility":0.480}},
+        {"agent_id":"agent_07","name":"Liquidity Scout","vote":"BUY","confidence":0.63,"reason":"Liquidity acceptable; expected value positive this tick.","signals":{"price":0.510,"implied_prob":0.560,"sentiment":-0.090,"volatility":0.360}},
+        {"agent_id":"agent_08","name":"Contrarian","vote":"HOLD","confidence":0.54,"reason":"No clear edge; preserve capital.","signals":{"price":0.400,"implied_prob":0.450,"sentiment":-0.600,"volatility":0.500}},
+        {"agent_id":"agent_09","name":"Momentum","vote":"BUY","confidence":0.64,"reason":"Momentum aligns; small probe position is justified.","signals":{"price":0.540,"implied_prob":0.600,"sentiment":0.180,"volatility":0.320}},
+        {"agent_id":"agent_10","name":"Mean Reversion","vote":"HOLD","confidence":0.56,"reason":"Spread too wide; wait for better entry.","signals":{"price":0.260,"implied_prob":0.310,"sentiment":-0.070,"volatility":0.640}},
+        {"agent_id":"agent_11","name":"Risk Manager","vote":"HOLD","confidence":0.58,"reason":"Risk budget tight; wait.","signals":{"price":0.410,"implied_prob":0.420,"sentiment":0.000,"volatility":0.490}},
+        {"agent_id":"agent_12","name":"Macro Filter","vote":"HOLD","confidence":0.57,"reason":"Macro headwinds; stay cautious.","signals":{"price":0.390,"implied_prob":0.410,"sentiment":-0.120,"volatility":0.470}},
+        {"agent_id":"agent_13","name":"Regime Detector","vote":"HOLD","confidence":0.55,"reason":"Regime uncertain; hold until confirmation.","signals":{"price":0.370,"implied_prob":0.400,"sentiment":-0.080,"volatility":0.540}},
+        {"agent_id":"agent_14","name":"Anomaly Watch","vote":"HOLD","confidence":0.54,"reason":"Minor anomaly; pause.","signals":{"price":0.360,"implied_prob":0.390,"sentiment":-0.020,"volatility":0.690}},
+        {"agent_id":"agent_15","name":"Edge Aggregator","vote":"HOLD","confidence":0.55,"reason":"Composite edge not strong enough.","signals":{"price":0.400,"implied_prob":0.440,"sentiment":-0.030,"volatility":0.520}}
+      ]
+    }
   ]
 }
