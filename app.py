@@ -130,10 +130,32 @@ async def upstash_setnx(key: str, value: str) -> int:
     return int(data.get("result", 0))
 
 
+async def upstash_expire(key: str, ttl_seconds: int) -> int:
+    """Upstash Redis REST: EXPIRE key ttl_seconds"""
+    if not KV_REST_API_URL or not KV_REST_API_TOKEN:
+        return 0
+
+    url = f"{KV_REST_API_URL}/expire/{quote(key)}/{int(ttl_seconds)}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(url, headers=_upstash_headers())
+
+    if r.status_code == 401:
+        return 0
+
+    r.raise_for_status()
+    data = r.json()
+    return int(data.get("result", 0))
+
+
 async def try_lock() -> Optional[str]:
     lock_id = str(uuid.uuid4())
     ok = await upstash_setnx(LOCK_KEY, lock_id)
     if ok == 1:
+        # best-effort TTL so a crashed worker doesn't block forever
+        try:
+            await upstash_expire(LOCK_KEY, LOCK_TTL_SECONDS)
+        except Exception:
+            pass
         return lock_id
     return None
 
@@ -572,7 +594,7 @@ async def admin_presets_post(body: Dict[str, Any], _: bool = Depends(require_aut
 
 
 @app.post("/run")
-async def run(_: bool = Depends(require_auth)):
+async def run(force: bool = False, _: bool = Depends(require_auth)):
     started = time.time()
     lock_id = await try_lock()
     if not lock_id:
@@ -587,6 +609,22 @@ async def run(_: bool = Depends(require_auth)):
         # tick increments (demo): based on unix time / 900 sec (15 min)
         tick = int(time.time() // 900)
         run_id = str(uuid.uuid4())
+
+        # Prevent accidental multiple executions within the same 15-min tick
+        # (use ?force=true to override for manual testing)
+        if not force and p.get("last_tick") == tick:
+            duration = round(time.time() - started, 3)
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "same_tick",
+                "message": "Already executed this tick (use force=true to override)",
+                "tick": tick,
+                "scenario": scenario,
+                "ts_ms": int(time.time() * 1000),
+                "portfolio": {"cash": p.get("cash"), "open_positions": len(p.get("positions", {}) or {})},
+                "duration_sec": duration,
+            }
 
         # 1) analyze all markets
         analyses = []
