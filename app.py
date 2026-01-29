@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # ----------------------------
-# Config (как у тебя: безопасность пофиг)
+# Config
 # ----------------------------
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "executor-secret-polyclawd-2026")
 
@@ -19,10 +19,22 @@ KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "AYCOAAIncDI5OTM2N2MzOTBiNGE0
 KV_REST_API_READ_ONLY_TOKEN = os.getenv("KV_REST_API_READ_ONLY_TOKEN", KV_REST_API_TOKEN)
 
 EXECUTOR_LOCK_KEY = os.getenv("EXECUTOR_LOCK_KEY", "executor:lock")
-LOCK_TTL_SECONDS = int(os.getenv("EXECUTOR_LOCK_TTL_SECONDS", "360"))  # 6 минут > 5 минут крона
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "200"))  # сколько элементов истории хранить
+LOCK_TTL_SECONDS = int(os.getenv("EXECUTOR_LOCK_TTL_SECONDS", "360"))  # 6 минут
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "200"))
 
 DEFAULT_MARKET_ID = os.getenv("DEFAULT_MARKET_ID", "POLY:DEMO_001")
+
+
+def sanitize_market_id(x: str) -> str:
+    s = (x or "").strip()
+    # убираем внешние кавычки если кто-то вставил "POLY:DEMO_001"
+    if (len(s) >= 2) and ((s[0] == s[-1]) and (s[0] in ("'", '"'))):
+        s = s[1:-1].strip()
+    return s or "POLY:DEMO_001"
+
+
+DEFAULT_MARKET_ID = sanitize_market_id(DEFAULT_MARKET_ID)
+
 
 # KV keys
 def k_scenario() -> str:
@@ -30,11 +42,11 @@ def k_scenario() -> str:
 
 
 def k_latest(market_id: str) -> str:
-    return f"executor:latest:{market_id}"
+    return f"executor:latest:{sanitize_market_id(market_id)}"
 
 
 def k_history(market_id: str) -> str:
-    return f"executor:history:{market_id}"
+    return f"executor:history:{sanitize_market_id(market_id)}"
 
 
 # ----------------------------
@@ -57,50 +69,38 @@ def require_auth(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> bool:
 
 
 # ----------------------------
-# Upstash REST helpers (NO httpx.utils)
+# Upstash REST helpers
 # ----------------------------
 def _h(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 
 def _q(s: str) -> str:
-    # Upstash REST path segments must be URL-encoded
     return quote(str(s), safe="")
 
 
 async def _post(path: str, token: str, timeout: float = 10.0) -> Dict[str, Any]:
     if not KV_REST_API_URL or not token:
         raise HTTPException(status_code=500, detail="KV_REST_API_URL / KV_REST_API_TOKEN missing")
+
     url = f"{KV_REST_API_URL}/{path.lstrip('/')}"
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(url, headers=_h(token))
+
     if r.status_code == 401:
         raise HTTPException(status_code=500, detail="Upstash 401 Unauthorized: check KV_REST_API_TOKEN")
     r.raise_for_status()
     return r.json()
 
 
-async def _get(path: str, token: str, timeout: float = 10.0) -> Dict[str, Any]:
-    if not KV_REST_API_URL or not token:
-        raise HTTPException(status_code=500, detail="KV_REST_API_URL / KV_REST_API_TOKEN missing")
-    url = f"{KV_REST_API_URL}/{path.lstrip('/')}"
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.get(url, headers=_h(token))
-    if r.status_code == 401:
-        raise HTTPException(status_code=500, detail="Upstash 401 Unauthorized: check KV token")
-    r.raise_for_status()
-    return r.json()
-
-
 async def kv_get(key: str, token: str) -> Optional[str]:
-    data = await _get(f"get/{_q(key)}", token)
-    # {"result": "value"} or {"result": null}
+    # ВАЖНО: используем POST и для get (самый надежный вариант)
+    data = await _post(f"get/{_q(key)}", token)
     return data.get("result", None)
 
 
 async def kv_set(key: str, value: str, token: str) -> bool:
     data = await _post(f"set/{_q(key)}/{_q(value)}", token)
-    # {"result": "OK"}
     return bool(data.get("result"))
 
 
@@ -126,7 +126,6 @@ async def try_lock() -> Optional[str]:
     lock_id = str(uuid.uuid4())
     ok = await kv_setnx(EXECUTOR_LOCK_KEY, lock_id, KV_REST_API_TOKEN)
     if ok == 1:
-        # держим лок чуть дольше периода крона
         try:
             await kv_expire(EXECUTOR_LOCK_KEY, LOCK_TTL_SECONDS, KV_REST_API_TOKEN)
         except Exception:
@@ -136,7 +135,6 @@ async def try_lock() -> Optional[str]:
 
 
 async def unlock(_: str) -> None:
-    # упрощенный unlock
     try:
         await kv_del(EXECUTOR_LOCK_KEY, KV_REST_API_TOKEN)
     except Exception:
@@ -147,17 +145,12 @@ async def unlock(_: str) -> None:
 # Fake agents preset
 # ----------------------------
 def load_agents_preset() -> List[Dict[str, Any]]:
-    """
-    Ищем пресет рядом с app.py:
-      - agents_preset.json
-    Если файла нет — генерим 15 дефолтных агентов.
-    """
     path = os.path.join(os.path.dirname(__file__), "agents_preset.json")
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict) and "agents" in data and isinstance(data["agents"], list):
+            if isinstance(data, dict) and isinstance(data.get("agents"), list):
                 return data["agents"]
             if isinstance(data, list):
                 return data
@@ -211,9 +204,7 @@ def digest_from_agents(agents: List[Dict[str, Any]], buy_count: int) -> Dict[str
             r = str(a.get("reason", "")).strip()
             if r:
                 buy_reasons.append(r)
-    # топ 3
-    top_buy_reasons = buy_reasons[:3]
-    return {"buy_count": buy_count, "top_buy_reasons": top_buy_reasons}
+    return {"buy_count": buy_count, "top_buy_reasons": buy_reasons[:3]}
 
 
 # ----------------------------
@@ -256,6 +247,7 @@ async def set_scenario(body: Dict[str, Any], _: bool = Depends(require_auth)):
 # --- Public endpoints for UI ---
 @app.get("/public/latest/{market_id}")
 async def public_latest(market_id: str):
+    market_id = sanitize_market_id(market_id)
     raw = await kv_get(k_latest(market_id), KV_REST_API_READ_ONLY_TOKEN)
     if not raw:
         return {"ok": True, "market_id": market_id, "data": None}
@@ -267,6 +259,7 @@ async def public_latest(market_id: str):
 
 @app.get("/public/history/{market_id}")
 async def public_history(market_id: str, minutes: int = 60):
+    market_id = sanitize_market_id(market_id)
     raw = await kv_get(k_history(market_id), KV_REST_API_READ_ONLY_TOKEN)
     if not raw:
         return {"ok": True, "market_id": market_id, "items": []}
@@ -278,7 +271,6 @@ async def public_history(market_id: str, minutes: int = 60):
     except Exception:
         items = []
 
-    # фильтр последнего часа (или minutes)
     now = int(time.time())
     cutoff = now - max(1, int(minutes)) * 60
     items = [it for it in items if int(it.get("ts", 0) or 0) >= cutoff]
@@ -298,12 +290,10 @@ async def run(_: bool = Depends(require_auth)):
     try:
         scenario = (await kv_get(k_scenario(), KV_REST_API_READ_ONLY_TOKEN)) or "neutral"
 
-        # делаем "тик": всегда новый номер
-        tick = int(time.time())  # простой и надежный для демо
+        tick = int(time.time())  # новый тик каждый запуск
 
         agents = load_agents_preset()
 
-        # (опционально) слегка "подкрашиваем" reason под сценарий, чтобы видно было разницу
         tail = {
             "bull": "scenario tailwind supports entry.",
             "bear": "risk-off regime; be selective.",
@@ -331,7 +321,7 @@ async def run(_: bool = Depends(require_auth)):
         # latest
         await kv_set(k_latest(DEFAULT_MARKET_ID), json.dumps(payload, ensure_ascii=False), KV_REST_API_TOKEN)
 
-        # history: append
+        # history append
         raw_hist = await kv_get(k_history(DEFAULT_MARKET_ID), KV_REST_API_READ_ONLY_TOKEN)
         if raw_hist:
             try:
@@ -344,20 +334,13 @@ async def run(_: bool = Depends(require_auth)):
             hist = []
 
         hist.append(payload)
-        # ограничим размер
         if len(hist) > HISTORY_LIMIT:
             hist = hist[-HISTORY_LIMIT:]
 
         await kv_set(k_history(DEFAULT_MARKET_ID), json.dumps(hist, ensure_ascii=False), KV_REST_API_TOKEN)
 
         duration = round(time.time() - started, 3)
-        return {
-            "ok": True,
-            "skipped": False,
-            "scenario": scenario,
-            "message": "tick executed",
-            "duration_sec": duration,
-        }
+        return {"ok": True, "skipped": False, "scenario": scenario, "message": "tick executed", "duration_sec": duration}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Executor error: {type(e).__name__}: {e}") from e
