@@ -663,7 +663,12 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
 
         # 2) close positions where SELL or confidence drops
         positions: Dict[str, Any] = p.get("positions", {}) or {}
+        positions_before: Dict[str, Any] = dict(positions)
         cash = float(p.get("cash", 0.0))
+
+        closed_positions: List[str] = []
+        opened_positions: List[str] = []
+        open_skip_reason: Dict[str, str] = {}
 
         # map market -> analysis for quick access
         analysis_by_market = {a["market_id"]: a for a in analyses}
@@ -676,10 +681,16 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             decision = a["summary"].get("decision")
             avg_conf = float(a["summary"].get("avg_confidence", 0))
 
-            if decision == "SELL" or avg_conf <= EXIT_CONFIDENCE_THRESHOLD:
+            if decision == "SELL":
                 qty = float(positions[mid].get("qty_usd", 0))
                 cash += qty
                 del positions[mid]
+                closed_positions.append(mid)
+            elif avg_conf <= EXIT_CONFIDENCE_THRESHOLD:
+                qty = float(positions[mid].get("qty_usd", 0))
+                cash += qty
+                del positions[mid]
+                closed_positions.append(mid)
 
         # 3) open positions where BUY (but max 6)
         pv = cash + sum(float(v.get("qty_usd", 0)) for v in positions.values())
@@ -694,22 +705,82 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
 
         for mid, _conf in buy_candidates:
             if mid in positions:
+                open_skip_reason[mid] = "already in position"
                 continue
             if len(positions) >= MAX_OPEN_POSITIONS:
+                open_skip_reason[mid] = f"max open positions reached ({MAX_OPEN_POSITIONS})"
                 break
             if cash <= 0:
+                open_skip_reason[mid] = "insufficient cash"
                 break
             qty = min(max_trade, cash)
             if qty <= 0:
+                open_skip_reason[mid] = "trade size <= 0"
                 break
             positions[mid] = {"market_id": mid, "qty_usd": round(qty, 2), "opened_ts": int(time.time())}
             cash -= qty
+            opened_positions.append(mid)
 
         # 4) save portfolio
         p["cash"] = round(cash, 2)
         p["positions"] = positions
         p["last_tick"] = tick
         await save_portfolio(p)
+
+        positions_after: Dict[str, Any] = p.get("positions", {}) or {}
+
+        def _execution_for_market(mid: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
+            decision = str(analysis.get("summary", {}).get("decision", "HOLD")).upper()
+            avg_conf = float(analysis.get("summary", {}).get("avg_confidence", 0))
+
+            was_in_position = mid in positions_before
+            is_in_position = mid in positions_after
+
+            # INTENT: what the strategy wanted to do
+            if was_in_position:
+                if decision == "SELL" or avg_conf <= EXIT_CONFIDENCE_THRESHOLD:
+                    intent = "EXIT"
+                elif decision == "BUY":
+                    intent = "ADD"
+                else:
+                    intent = "HOLD"
+            else:
+                if decision == "BUY":
+                    intent = "OPEN"
+                else:
+                    intent = "HOLD"
+
+            # ACTION: what actually happened
+            action = "NONE"
+            reason = ""
+
+            if mid in closed_positions:
+                action = "CLOSE"
+                reason = "closed due to SELL" if decision == "SELL" else "closed due to low confidence"
+            elif mid in opened_positions:
+                action = "OPEN"
+                reason = "opened due to BUY"
+            else:
+                # No portfolio change on this market
+                if intent == "ADD" and is_in_position:
+                    action = "NONE"
+                    reason = "scaling not implemented (ADD disabled)"
+                elif intent == "OPEN" and not is_in_position:
+                    action = "NONE"
+                    reason = open_skip_reason.get(mid, "not opened")
+                elif intent == "EXIT" and was_in_position and is_in_position:
+                    action = "NONE"
+                    reason = "exit conditions not met"
+
+            return {
+                "in_position": is_in_position,
+                "was_in_position": was_in_position,
+                "intent": intent,
+                "action": action,
+                "reason": reason,
+                "decision": decision,
+                "avg_confidence": avg_conf,
+            }
 
         # 5) write histories (per market)
         for a in analyses:
@@ -723,11 +794,7 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
                 "scenario": scenario,
                 "summary": a["summary"],
                 "digest": a["digest"],
-                "execution": {
-                    "in_position": mid in p.get("positions", {}),
-                    "decision": a["summary"].get("decision"),
-                    "avg_confidence": a["summary"].get("avg_confidence"),
-                },
+                "execution": _execution_for_market(mid, a),
                 "portfolio": {
                     "value": round(portfolio_value(p), 2),
                     "cash": p["cash"],
@@ -748,6 +815,11 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             "run_id": run_id,
             "ts_ms": int(time.time() * 1000),
             "portfolio": {"cash": p["cash"], "open_positions": len(p["positions"])},
+            "execution_summary": {
+                "opened": opened_positions,
+                "closed": closed_positions,
+                "open_skipped": open_skip_reason,
+            },
             "duration_sec": duration,
         }
 
