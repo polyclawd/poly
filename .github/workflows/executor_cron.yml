@@ -1,0 +1,25 @@
+name: Executor Cron
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # каждые 15 минут
+  workflow_dispatch:          # чтобы можно было руками запускать
+
+jobs:
+  run-executor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call executor /run
+        run: |
+          echo "Calling: $EXECUTOR_URL"
+          curl -sS -X POST "$EXECUTOR_URL" \
+            -H "Authorization: Bearer $EXECUTOR_SECRET" \
+            -H "Content-Type: application/json" \
+            --data '{}' \
+            | tee response.json
+          echo ""
+          echo "Done. Response:"
+          cat response.json
+        env:
+          EXECUTOR_URL: ${{ secrets.EXECUTOR_URL }}
+          EXECUTOR_SECRET: ${{ secrets.EXECUTOR_SECRET }}
