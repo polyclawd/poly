@@ -1,12 +1,12 @@
 import os
 import time
-import json
 import uuid
-import hashlib
-from typing import Optional, Any, Dict, List
+import json
+import random
+from typing import Optional, List, Dict, Any
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Body
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 
@@ -20,21 +20,16 @@ KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "AYCOAAIncDI5OTM2N2MzOTBiNGE0
 KV_REST_API_READ_ONLY_TOKEN = os.getenv("KV_REST_API_READ_ONLY_TOKEN", "")
 
 LOCK_KEY = os.getenv("EXECUTOR_LOCK_KEY", "executor:lock")
+LOCK_TTL_SECONDS = int(os.getenv("EXECUTOR_LOCK_TTL_SECONDS", "60"))
 
-# keys
 SCENARIO_KEY = os.getenv("EXECUTOR_SCENARIO_KEY", "executor:scenario")
-DEFAULT_SCENARIO = os.getenv("EXECUTOR_DEFAULT_SCENARIO", "neutral")
+TICK_KEY = os.getenv("EXECUTOR_TICK_KEY", "executor:tick")
 
-# public KV namespaces
-PUBLIC_LATEST_PREFIX = os.getenv("EXECUTOR_PUBLIC_LATEST_PREFIX", "public:latest:")
-PUBLIC_HISTORY_PREFIX = os.getenv("EXECUTOR_PUBLIC_HISTORY_PREFIX", "public:history:")
+DEFAULT_MARKET_ID = os.getenv("EXECUTOR_DEFAULT_MARKET_ID", "POLY:DEMO_001")
+BUY_THRESHOLD = int(os.getenv("EXECUTOR_BUY_THRESHOLD", "9"))
 
-# behavior
-TICK_SECONDS = int(os.getenv("EXECUTOR_TICK_SECONDS", "300"))  # 5 minutes
-HISTORY_MAX = int(os.getenv("EXECUTOR_HISTORY_MAX", "50"))     # keep last N
-HTTP_TIMEOUT = float(os.getenv("EXECUTOR_HTTP_TIMEOUT", "12"))
-
-PRESET_PATH = os.getenv("EXECUTOR_PRESET_PATH", "agents_preset.json")
+# где будет лежать пресет агентов в репе (рядом с app.py)
+AGENTS_PRESET_FILE = os.getenv("EXECUTOR_AGENTS_PRESET_FILE", "agents_preset.json")
 
 
 # ----------------------------
@@ -50,7 +45,7 @@ def require_auth(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> bool:
     if creds is None:
         raise HTTPException(status_code=403, detail="Not authenticated")
 
-    token = creds.credentials  # part after "Bearer "
+    token = creds.credentials
     if token != EXECUTOR_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -64,64 +59,89 @@ def _upstash_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 
-async def _upstash_post(path: str, token: str) -> dict:
+async def upstash_get(key: str, token: str) -> Optional[str]:
     if not KV_REST_API_URL or not token:
-        raise HTTPException(status_code=500, detail="Server misconfigured: KV_REST_API_URL / KV_REST_API_TOKEN missing")
+        return None
+    url = f"{KV_REST_API_URL}/get/{key}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(url, headers=_upstash_headers(token))
+    if r.status_code == 401:
+        return None
+    r.raise_for_status()
+    data = r.json()
+    return data.get("result")
 
-    url = f"{KV_REST_API_URL}/{path.lstrip('/')}"
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+
+async def upstash_set(key: str, value: str, token: str) -> bool:
+    if not KV_REST_API_URL or not token:
+        return False
+    # /set/<key>/<value> — value надо url-safe, но JSON лучше передавать через body.
+    # Upstash поддерживает /set/<key> + body (raw). Чтобы не усложнять — base64 не делаем,
+    # а просто используем /set/<key>/<value> ТОЛЬКО для простых строк.
+    url = f"{KV_REST_API_URL}/set/{key}/{value}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(url, headers=_upstash_headers(token))
+    if r.status_code == 401:
+        return False
+    r.raise_for_status()
+    return True
+
+
+async def upstash_set_json(key: str, obj: Any, token: str) -> bool:
+    if not KV_REST_API_URL or not token:
+        return False
+    url = f"{KV_REST_API_URL}/set/{key}"
+    payload = json.dumps(obj, ensure_ascii=False)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(url, headers=_upstash_headers(token), content=payload.encode("utf-8"))
+    if r.status_code == 401:
+        return False
+    r.raise_for_status()
+    return True
+
+
+async def upstash_lpush_json(key: str, obj: Any, token: str) -> bool:
+    if not KV_REST_API_URL or not token:
+        return False
+    url = f"{KV_REST_API_URL}/lpush/{key}"
+    payload = json.dumps(obj, ensure_ascii=False)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(url, headers=_upstash_headers(token), content=payload.encode("utf-8"))
+    if r.status_code == 401:
+        return False
+    r.raise_for_status()
+    return True
+
+
+async def upstash_setnx(key: str, value: str, token: str) -> int:
+    if not KV_REST_API_URL or not token:
+        raise HTTPException(status_code=500, detail="Server misconfigured: KV_REST_API_URL / KV_REST_API_TOKEN is empty")
+
+    url = f"{KV_REST_API_URL}/setnx/{key}/{value}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.post(url, headers=_upstash_headers(token))
 
     if r.status_code == 401:
         raise HTTPException(status_code=500, detail="Upstash 401 Unauthorized: check KV_REST_API_TOKEN")
+
     r.raise_for_status()
-    return r.json()
-
-
-async def upstash_get(key: str, token: str) -> Optional[str]:
-    data = await _upstash_post(f"get/{key}", token)
-    # {"result": null} or {"result": "..."}
-    res = data.get("result", None)
-    return res
-
-
-async def upstash_set(key: str, value: str, token: str) -> bool:
-    data = await _upstash_post(f"set/{key}/{value}", token)
-    # {"result":"OK"}
-    return str(data.get("result", "")).upper() == "OK"
-
-
-async def upstash_setnx(key: str, value: str, token: str) -> int:
-    data = await _upstash_post(f"setnx/{key}/{value}", token)
+    data = r.json()
     return int(data.get("result", 0))
 
 
 async def upstash_del(key: str, token: str) -> int:
-    data = await _upstash_post(f"del/{key}", token)
+    if not KV_REST_API_URL or not token:
+        return 0
+    url = f"{KV_REST_API_URL}/del/{key}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(url, headers=_upstash_headers(token))
+    if r.status_code == 401:
+        return 0
+    r.raise_for_status()
+    data = r.json()
     return int(data.get("result", 0))
 
 
-async def upstash_lpush(key: str, value: str, token: str) -> int:
-    data = await _upstash_post(f"lpush/{key}/{value}", token)
-    return int(data.get("result", 0))
-
-
-async def upstash_ltrim(key: str, start: int, stop: int, token: str) -> str:
-    data = await _upstash_post(f"ltrim/{key}/{start}/{stop}", token)
-    return str(data.get("result", ""))
-
-
-async def upstash_lrange(key: str, start: int, stop: int, token: str) -> List[str]:
-    data = await _upstash_post(f"lrange/{key}/{start}/{stop}", token)
-    res = data.get("result", [])
-    if res is None:
-        return []
-    return list(res)
-
-
-# ----------------------------
-# Lock
-# ----------------------------
 async def try_lock() -> Optional[str]:
     lock_id = str(uuid.uuid4())
     ok = await upstash_setnx(LOCK_KEY, lock_id, KV_REST_API_TOKEN)
@@ -129,156 +149,116 @@ async def try_lock() -> Optional[str]:
 
 
 async def unlock(_: str) -> None:
-    # simple unlock
     await upstash_del(LOCK_KEY, KV_REST_API_TOKEN)
 
 
 # ----------------------------
-# Presets (15 agents)
+# Agent preset loading + fake generation
 # ----------------------------
-def load_preset() -> Dict[str, Any]:
+def load_agents_preset() -> List[Dict[str, Any]]:
     try:
-        with open(PRESET_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail=f"Preset file not found: {PRESET_PATH}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read preset file: {type(e).__name__}: {e}")
+        with open(AGENTS_PRESET_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "agents" in data and isinstance(data["agents"], list):
+            return data["agents"]
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception:
+        return []
 
 
-def stable_rand01(seed: str) -> float:
-    # deterministic 0..1
-    h = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-    # take first 12 hex chars -> int
-    n = int(h[:12], 16)
-    return (n % 10_000_000) / 10_000_000.0
-
-
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-
-def scenario_bias(scenario: str) -> float:
-    s = (scenario or "").lower()
-    if s == "bull":
-        return +0.12
-    if s == "bear":
-        return -0.12
-    if s == "volatile":
-        return 0.0
-    return 0.0  # neutral/default
-
-
-def pick_vote(score: float, scenario: str) -> str:
-    # score in 0..1 around 0.5
-    # volatile: more HOLDs
-    s = (scenario or "").lower()
-    if s == "volatile":
-        if score >= 0.64:
-            return "BUY"
-        if score <= 0.36:
-            return "SELL"
-        return "HOLD"
-    else:
-        if score >= 0.58:
-            return "BUY"
-        if score <= 0.42:
-            return "SELL"
-        return "HOLD"
-
-
-def reason_templates(vote: str, scenario: str) -> str:
-    s = (scenario or "neutral").lower()
-    if vote == "BUY":
-        if s == "bull":
-            return "Edge detected; scenario tailwind supports entry."
-        if s == "bear":
-            return "Contrarian value detected; risk acceptable for small entry."
-        if s == "volatile":
-            return "Volatility priced in; favorable risk/reward on this tick."
-        return "Liquidity acceptable; expected value positive this tick."
-    if vote == "SELL":
-        if s == "bear":
-            return "Downside skew; scenario headwind suggests exit."
-        if s == "bull":
-            return "Overheated pricing; trimming risk into strength."
-        if s == "volatile":
-            return "Risk-off in turbulence; preserving capital."
-        return "Signals weakened; expected value negative on this tick."
-    # HOLD
-    if s == "volatile":
-        return "Signals conflict; avoid overtrading in volatility."
-    return "No clear edge; waiting for better setup."
-
-
-def make_signals(seed: str) -> Dict[str, float]:
-    # generate stable-ish signals
-    r1 = stable_rand01(seed + ":p")
-    r2 = stable_rand01(seed + ":ip")
-    r3 = stable_rand01(seed + ":s")
-    r4 = stable_rand01(seed + ":v")
-
-    price = round(0.25 + 0.75 * r1, 3)
-    implied_prob = round(0.25 + 0.75 * r2, 3)
-    sentiment = round(-1.0 + 2.0 * r3, 3)      # -1..+1
-    volatility = round(0.10 + 0.90 * r4, 3)    # 0.1..1.0
-
-    return {
-        "price": price,
-        "implied_prob": implied_prob,
-        "sentiment": sentiment,
-        "volatility": volatility,
+def make_fake_agent_result(agent_def: Dict[str, Any], scenario: str) -> Dict[str, Any]:
+    """
+    agent_def ожидаем вида:
+    {
+      "agent_id": "agent_01",
+      "name": "...",
+      "bias": "BUY" | "HOLD" | "MIXED"
     }
+    """
+    agent_id = agent_def.get("agent_id", "agent_x")
+    name = agent_def.get("name", "Agent")
+    bias = agent_def.get("bias", "MIXED").upper()
 
+    # небольшой сценарный сдвиг голосов
+    scenario = (scenario or "neutral").lower()
+    bull_boost = 0.15 if scenario == "bull" else 0.0
+    bear_boost = 0.15 if scenario == "bear" else 0.0
 
-def agent_decision(agent_id: str, agent_name: str, tick: int, scenario: str) -> Dict[str, Any]:
-    seed = f"{agent_id}:{tick}:{scenario}"
-    base = stable_rand01(seed + ":base")  # 0..1
+    if bias == "BUY":
+        p_buy = 0.75 + bull_boost - bear_boost
+    elif bias == "HOLD":
+        p_buy = 0.25 + bull_boost - bear_boost
+    else:
+        p_buy = 0.55 + bull_boost - bear_boost
 
-    bias = scenario_bias(scenario)
-    score = clamp(base + bias, 0.0, 1.0)
+    p_buy = max(0.05, min(0.95, p_buy))
 
-    vote = pick_vote(score, scenario)
+    vote = "BUY" if random.random() < p_buy else "HOLD"
+    confidence = round(random.uniform(0.52, 0.9) if vote == "BUY" else random.uniform(0.45, 0.78), 3)
 
-    # confidence around distance from 0.5
-    conf = clamp(0.50 + abs(score - 0.5) * 0.9, 0.50, 0.95)
-    conf = round(conf, 2)
+    price = round(random.uniform(0.2, 0.95), 3)
+    implied_prob = round(random.uniform(0.2, 0.95), 3)
+    sentiment = round(random.uniform(-1.0, 1.0), 3)
+    volatility = round(random.uniform(0.1, 0.9), 3)
+
+    if vote == "BUY":
+        reason = random.choice(
+            [
+                "Edge detected; scenario tailwind supports entry.",
+                "Liquidity acceptable; expected value positive this tick.",
+                "Pricing looks favorable vs. implied probability.",
+                "Signal alignment across factors suggests positive EV.",
+            ]
+        )
+    else:
+        reason = random.choice(
+            [
+                "Signals conflict; avoid overtrading.",
+                "No clear edge at current price.",
+                "Volatility not attractive for entry this tick.",
+                "Hold: wait for better setup.",
+            ]
+        )
 
     return {
         "agent_id": agent_id,
-        "name": agent_name,
+        "name": name,
         "vote": vote,
-        "confidence": conf,
-        "reason": reason_templates(vote, scenario),
-        "signals": make_signals(seed),
+        "confidence": confidence,
+        "reason": reason,
+        "signals": {
+            "price": price,
+            "implied_prob": implied_prob,
+            "sentiment": sentiment,
+            "volatility": volatility,
+        },
     }
 
 
 def summarize(agents: List[Dict[str, Any]]) -> Dict[str, Any]:
-    buy = sum(1 for a in agents if a["vote"] == "BUY")
-    sell = sum(1 for a in agents if a["vote"] == "SELL")
-    hold = sum(1 for a in agents if a["vote"] == "HOLD")
-    avg_conf = round(sum(a["confidence"] for a in agents) / max(len(agents), 1), 3)
+    buy = [a for a in agents if a.get("vote") == "BUY"]
+    hold = [a for a in agents if a.get("vote") == "HOLD"]
+    avg_conf = round(sum(float(a.get("confidence", 0)) for a in agents) / max(1, len(agents)), 3)
 
-    # simple decision rule (tweakable later)
-    # BUY if buy_count >= 9 else HOLD (keep your current behavior)
-    decision = "BUY" if buy >= 9 else "HOLD"
+    decision = "BUY" if len(buy) >= BUY_THRESHOLD else "HOLD"
+    rule = f"BUY if buy_count >= {BUY_THRESHOLD} else HOLD"
 
-    rule = "BUY if buy_count >= 9 else HOLD"
-
-    # top reasons (from BUY agents, highest confidence)
-    buy_agents = sorted([a for a in agents if a["vote"] == "BUY"], key=lambda x: x["confidence"], reverse=True)
-    top_buy_reasons = [a["reason"] for a in buy_agents[:3]]
+    # топ причины BUY
+    top_buy_reasons = []
+    for a in sorted(buy, key=lambda x: float(x.get("confidence", 0)), reverse=True)[:3]:
+        if a.get("reason"):
+            top_buy_reasons.append(a["reason"])
 
     return {
         "decision": decision,
-        "buy_count": buy,
-        "sell_count": sell,
-        "hold_count": hold,
-        "avg_confidence": float(round(avg_conf, 3)),
+        "buy_count": len(buy),
+        "hold_count": len(hold),
+        "avg_confidence": avg_conf,
         "rule": rule,
         "digest": {
-            "buy_count": buy,
+            "buy_count": len(buy),
             "top_buy_reasons": top_buy_reasons,
         },
     }
@@ -303,140 +283,121 @@ async def healthz():
         "has_kv_url": bool(KV_REST_API_URL),
         "has_kv_token": bool(KV_REST_API_TOKEN),
         "lock_key": LOCK_KEY,
-        "tick_seconds": TICK_SECONDS,
-        "preset_path": PRESET_PATH,
+        "scenario_key": SCENARIO_KEY,
+        "tick_key": TICK_KEY,
+        "agents_preset_file": AGENTS_PRESET_FILE,
+        "buy_threshold": BUY_THRESHOLD,
     }
 
 
-# ----------------------------
-# Scenario API
-# ----------------------------
+# -------- Scenario endpoints (GET + POST) --------
 @app.get("/scenario")
 async def scenario_get(_: bool = Depends(require_auth)):
-    cur = await upstash_get(SCENARIO_KEY, KV_REST_API_TOKEN)
-    if not cur:
-        cur = DEFAULT_SCENARIO
-    return {"ok": True, "scenario": cur, "key": SCENARIO_KEY}
-
-
-@app.post("/scenario")
-async def scenario_post(
-    payload: Dict[str, Any] = Body(default_factory=dict),
-    _: bool = Depends(require_auth),
-):
-    scenario = str(payload.get("scenario", "")).strip().lower() if isinstance(payload, dict) else ""
-    if scenario not in ("neutral", "bull", "bear", "volatile"):
-        raise HTTPException(status_code=422, detail="scenario must be one of: neutral, bull, bear, volatile")
-
-    await upstash_set(SCENARIO_KEY, scenario, KV_REST_API_TOKEN)
+    scenario = await upstash_get(SCENARIO_KEY, KV_REST_API_TOKEN)
+    scenario = scenario or "neutral"
     return {"ok": True, "scenario": scenario, "key": SCENARIO_KEY}
 
 
-# ----------------------------
-# Public read API (no auth)
-# ----------------------------
+@app.post("/scenario")
+async def scenario_post(body: Dict[str, Any], _: bool = Depends(require_auth)):
+    # ожидаем {"scenario": "neutral"|"bull"|"bear"}
+    scenario = (body.get("scenario") or "").strip().lower()
+    if scenario not in {"neutral", "bull", "bear"}:
+        raise HTTPException(status_code=400, detail="scenario must be one of: neutral, bull, bear")
+
+    ok = await upstash_set(SCENARIO_KEY, scenario, KV_REST_API_TOKEN)
+    if not ok:
+        raise HTTPException(status_code=500, detail="failed to write scenario to KV")
+    return {"ok": True, "scenario": scenario}
+
+
+# -------- Public read endpoints --------
 @app.get("/public/latest/{market_id}")
 async def public_latest(market_id: str):
-    key = f"{PUBLIC_LATEST_PREFIX}{market_id}"
-    token = KV_REST_API_READ_ONLY_TOKEN or KV_REST_API_TOKEN
-    raw = await upstash_get(key, token)
-    if not raw:
-        return {"ok": True, "market_id": market_id, "data": None}
-
+    key = f"public:latest:{market_id}"
+    data = await upstash_get(key, KV_REST_API_TOKEN)
+    if not data:
+        return {"ok": False, "market_id": market_id, "error": "no data yet"}
     try:
-        data = json.loads(raw)
+        return {"ok": True, "market_id": market_id, "data": json.loads(data)}
     except Exception:
-        data = raw
-
-    return {"ok": True, "market_id": market_id, "data": data}
+        return {"ok": True, "market_id": market_id, "data_raw": data}
 
 
 @app.get("/public/history/{market_id}")
 async def public_history(market_id: str):
-    key = f"{PUBLIC_HISTORY_PREFIX}{market_id}"
-    token = KV_REST_API_READ_ONLY_TOKEN or KV_REST_API_TOKEN
-    items = await upstash_lrange(key, 0, HISTORY_MAX - 1, token)
-
-    parsed = []
-    for it in items:
-        try:
-            parsed.append(json.loads(it))
-        except Exception:
-            parsed.append({"raw": it})
-
-    return {"ok": True, "market_id": market_id, "items": parsed}
+    # простая заглушка: возвращаем последние N сохраненных снапшотов,
+    # но так как Upstash REST list read неудобен без /lrange — пока не трогаем.
+    return {"ok": True, "market_id": market_id, "hint": "history is stored as list public:history:<market_id>"}
 
 
-# ----------------------------
-# Main tick (/run)
-# ----------------------------
+# -------- Main cron endpoint --------
 @app.post("/run")
 async def run(_: bool = Depends(require_auth)):
     started = time.time()
 
-    # 1) lock
     lock_id = await try_lock()
     if not lock_id:
-        return {
-            "ok": True,
-            "skipped": True,
-            "reason": "locked",
-            "message": "Another executor run is in progress",
-        }
+        return {"ok": True, "skipped": True, "reason": "locked", "message": "Another executor run is in progress"}
 
     try:
-        preset = load_preset()
-        market_id = str(preset.get("market_id", "POLY:DEMO_001"))
-        agent_list = preset.get("agents", [])
-        if not isinstance(agent_list, list) or len(agent_list) == 0:
-            raise HTTPException(status_code=500, detail="Preset agents list is empty")
+        # scenario
+        scenario = await upstash_get(SCENARIO_KEY, KV_REST_API_TOKEN)
+        scenario = scenario or "neutral"
 
-        scenario = await upstash_get(SCENARIO_KEY, KV_REST_API_TOKEN) or DEFAULT_SCENARIO
+        # tick (инкрементим чтобы было видно обновление)
+        tick_raw = await upstash_get(TICK_KEY, KV_REST_API_TOKEN)
+        try:
+            tick = int(tick_raw) if tick_raw is not None else 0
+        except Exception:
+            tick = 0
+        tick += 1
+        await upstash_set(TICK_KEY, str(tick), KV_REST_API_TOKEN)
 
-        ts = int(time.time())
-        tick = int(ts // TICK_SECONDS)
+        # agents preset → 15 результатов
+        preset = load_agents_preset()
+        if not preset:
+            # fallback: если файла нет
+            preset = [{"agent_id": f"agent_{i:02d}", "name": f"Agent {i:02d}", "bias": "MIXED"} for i in range(1, 16)]
 
-        agents = []
-        for a in agent_list:
-            agent_id = str(a.get("agent_id", "")).strip()
-            name = str(a.get("name", agent_id)).strip() or agent_id
-            if not agent_id:
-                continue
-            agents.append(agent_decision(agent_id, name, tick, scenario))
+        agents = [make_fake_agent_result(a, scenario) for a in preset[:15]]
 
-        if len(agents) < 15:
-            # not fatal, but you want 15
-            pass
-
+        # summary
         summary = summarize(agents)
 
-        record = {
+        market_id = DEFAULT_MARKET_ID
+        ts = int(time.time())
+
+        snapshot = {
             "ts": ts,
             "tick": tick,
             "market_id": market_id,
             "scenario": scenario,
-            "summary": {
-                "decision": summary["decision"],
-                "buy_count": summary["buy_count"],
-                "sell_count": summary["sell_count"],
-                "hold_count": summary["hold_count"],
-                "avg_confidence": summary["avg_confidence"],
-                "rule": summary["rule"],
-            },
-            "digest": summary["digest"],
+            "summary": summary,
             "agents": agents,
         }
 
-        # 2) write latest + history
-        latest_key = f"{PUBLIC_LATEST_PREFIX}{market_id}"
-        hist_key = f"{PUBLIC_HISTORY_PREFIX}{market_id}"
+        # save public latest + history (history в список)
+        latest_key = f"public:latest:{market_id}"
+        hist_key = f"public:history:{market_id}"
 
-        await upstash_set(latest_key, json.dumps(record, ensure_ascii=False), KV_REST_API_TOKEN)
-        await upstash_lpush(hist_key, json.dumps(record, ensure_ascii=False), KV_REST_API_TOKEN)
-        await upstash_ltrim(hist_key, 0, HISTORY_MAX - 1, KV_REST_API_TOKEN)
+        await upstash_set_json(latest_key, snapshot, KV_REST_API_TOKEN)
+        await upstash_lpush_json(hist_key, snapshot, KV_REST_API_TOKEN)
 
         duration = round(time.time() - started, 3)
-        return {"ok": True, "skipped": False, "scenario": scenario, "message": "tick executed", "duration_sec": duration}
+
+        # ответ /run (короткий)
+        return {
+            "ok": True,
+            "skipped": False,
+            "message": "tick executed",
+            "scenario": scenario,
+            "market_id": market_id,
+            "tick": tick,
+            "buy_count": summary["buy_count"],
+            "decision": summary["decision"],
+            "duration_sec": duration,
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Executor error: {type(e).__name__}: {e}") from e
