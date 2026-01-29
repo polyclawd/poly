@@ -623,8 +623,9 @@ async def admin_presets_post(body: Dict[str, Any], _: bool = Depends(require_aut
     return {"ok": True, "key": PRESETS_KEY}
 
 
-@app.post("/run")
-async def run(force: bool = False, _: bool = Depends(require_auth)):
+
+async def _execute_run(force: bool = False) -> Dict[str, Any]:
+    """Shared run implementation used by authenticated /run and token-based cron endpoint."""
     started = time.time()
     lock_id = await try_lock()
     if not lock_id:
@@ -634,7 +635,6 @@ async def run(force: bool = False, _: bool = Depends(require_auth)):
         scenario = await get_scenario()
         presets = await load_presets()
         p = await load_portfolio()
-        pv = portfolio_value(p)
 
         # tick increments (demo): based on unix time / 900 sec (15 min)
         tick = int(time.time() // 900)
@@ -751,11 +751,33 @@ async def run(force: bool = False, _: bool = Depends(require_auth)):
             "duration_sec": duration,
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Executor error: {type(e).__name__}: {e}") from e
-
     finally:
         try:
             await unlock(lock_id)
         except Exception:
             pass
+
+
+@app.post("/run")
+async def run(force: bool = False, _: bool = Depends(require_auth)):
+    try:
+        return await _execute_run(force=force)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Executor error: {type(e).__name__}: {e}") from e
+
+
+# Cron-friendly endpoint for Render/other schedulers
+@app.get("/cron/run")
+async def cron_run(token: str, force: bool = False):
+    """Cron endpoint for Render/other schedulers that may not support Swagger auth.
+
+    Call: GET /cron/run?token=<EXECUTOR_SECRET>
+    """
+    if not EXECUTOR_SECRET:
+        raise HTTPException(status_code=500, detail="Server misconfigured: EXECUTOR_SECRET is empty")
+    if token != EXECUTOR_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        return await _execute_run(force=force)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Executor error: {type(e).__name__}: {e}") from e
