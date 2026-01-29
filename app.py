@@ -559,6 +559,36 @@ async def public_portfolio():
     return {"ok": True, "portfolio": p, "value": portfolio_value(p)}
 
 
+# ---- Inserted endpoints ----
+
+@app.get("/public/markets")
+async def public_markets():
+    """Small helper for the frontend so it doesn't hardcode markets."""
+    return {"ok": True, "markets": MARKETS}
+
+
+@app.get("/public/snapshot")
+async def public_snapshot():
+    """One-call API for the frontend: scenario + portfolio + latest per market."""
+    scenario = await get_scenario()
+    p = await load_portfolio()
+
+    latest_by_market: Dict[str, Any] = {}
+    for m in MARKETS:
+        latest_by_market[m] = await get_latest(m)
+
+    return {
+        "ok": True,
+        "scenario": scenario,
+        "markets": MARKETS,
+        "portfolio": p,
+        "value": portfolio_value(p),
+        "latest": latest_by_market,
+        "ts": int(time.time()),
+        "ts_ms": int(time.time() * 1000),
+    }
+
+
 @app.post("/admin/reset")
 async def admin_reset(_: bool = Depends(require_auth)):
     deleted = []
