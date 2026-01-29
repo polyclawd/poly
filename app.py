@@ -3,10 +3,11 @@ import time
 import uuid
 import random
 import json
+import base64
 from typing import Optional, Dict, Any, List
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Path
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -23,15 +24,49 @@ KV_REST_API_READ_ONLY_TOKEN = os.getenv("KV_REST_API_READ_ONLY_TOKEN", "") or KV
 LOCK_KEY = os.getenv("EXECUTOR_LOCK_KEY", "executor:lock")
 SCENARIO_KEY = os.getenv("EXECUTOR_SCENARIO_KEY", "executor:scenario")
 
-# где хранить последний расчёт для сайта
-PUBLIC_LATEST_KEY = os.getenv("PUBLIC_LATEST_KEY", "public:latest")
+# base keys for public data
+PUBLIC_INDEX_KEY = os.getenv("PUBLIC_INDEX_KEY", "public:latest:index")
+PUBLIC_MARKET_KEY_PREFIX = os.getenv("PUBLIC_MARKET_KEY_PREFIX", "public:latest:market:")
 
 LOCK_TTL_SECONDS = int(os.getenv("EXECUTOR_LOCK_TTL_SECONDS", "60"))
 RUN_TIMEOUT_SECONDS = float(os.getenv("EXECUTOR_RUN_TIMEOUT_SECONDS", "25"))
 
-POSITION_ID = os.getenv("POSITION_ID", "POLYMARKET:DEMO_POSITION_001")
-
 ALLOWED_SCENARIOS = {"bull", "neutral", "bear"}
+
+# 15 markets (позиции) можно задать ENV: MARKETS="id1,id2,id3,..."
+DEFAULT_MARKETS = [
+    "POLY:DEMO_001",
+    "POLY:DEMO_002",
+    "POLY:DEMO_003",
+    "POLY:DEMO_004",
+    "POLY:DEMO_005",
+    "POLY:DEMO_006",
+    "POLY:DEMO_007",
+    "POLY:DEMO_008",
+    "POLY:DEMO_009",
+    "POLY:DEMO_010",
+    "POLY:DEMO_011",
+    "POLY:DEMO_012",
+    "POLY:DEMO_013",
+    "POLY:DEMO_014",
+    "POLY:DEMO_015",
+]
+
+
+def get_markets() -> List[str]:
+    raw = (os.getenv("MARKETS") or "").strip()
+    if not raw:
+        return DEFAULT_MARKETS
+    # clean & unique
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    # keep order, remove dups
+    seen = set()
+    out = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out[:15] if len(out) > 15 else out
 
 
 # ============================================================
@@ -155,7 +190,7 @@ class ScenarioBody(BaseModel):
 
 
 # ============================================================
-# Fake Agents
+# Fake Agents (per market)
 # ============================================================
 AGENT_NAMES = [
     "Market Microstructure",
@@ -176,14 +211,16 @@ AGENT_NAMES = [
 ]
 
 
-def _agent_decision(agent_idx: int, scenario: str) -> Dict[str, Any]:
-    seed = (agent_idx + 1) * 1000 + {"bull": 1, "neutral": 2, "bear": 3}[scenario]
+def _agent_decision(agent_idx: int, scenario: str, market_id: str, tick: int) -> Dict[str, Any]:
+    # детерминированный seed на (agent, scenario, market, tick)
+    base = {"bull": 1, "neutral": 2, "bear": 3}[scenario]
+    seed = (agent_idx + 1) * 1000 + base * 100 + (hash(market_id) % 1000) + (tick % 1000) * 7
     rnd = random.Random(seed)
 
     if scenario == "bull":
-        buy_prob = 0.72
+        buy_prob = 0.70
     elif scenario == "bear":
-        buy_prob = 0.22
+        buy_prob = 0.20
     else:
         buy_prob = 0.45
 
@@ -193,20 +230,19 @@ def _agent_decision(agent_idx: int, scenario: str) -> Dict[str, Any]:
     if not vote_buy:
         confidence = round(max(0.5, confidence - 0.15), 2)
 
-    reason_templates_buy = [
-        "Implied probability looks undervalued vs. our prior; small edge detected.",
-        "Short-term momentum supports entry; risk bounded by size limits.",
-        "Market drift aligns with scenario; expected value positive on this tick.",
-        "Spread/liquidity acceptable; timing ok for a small probe position.",
+    reason_buy = [
+        "Edge detected; scenario tailwind supports entry.",
+        "Momentum aligns; small probe position is justified.",
+        "Liquidity acceptable; expected value positive this tick.",
+        "Pricing looks favorable vs. implied probability.",
     ]
-    reason_templates_hold = [
-        "Edge not clear this tick; better to wait for confirmation.",
-        "Conflicting signals; avoid overtrading in mixed conditions.",
-        "Risk/reward not compelling given scenario; hold capital.",
-        "Liquidity/spread not favorable; skip this tick.",
+    reason_hold = [
+        "Edge unclear this tick; wait for better confirmation.",
+        "Signals conflict; avoid overtrading.",
+        "Risk not attractive at current pricing; hold.",
+        "Spread/liquidity not favorable; skip.",
     ]
-
-    reason = rnd.choice(reason_templates_buy if vote_buy else reason_templates_hold)
+    reason = rnd.choice(reason_buy if vote_buy else reason_hold)
 
     signals = {
         "price": round(0.35 + rnd.random() * 0.55, 3),
@@ -225,14 +261,13 @@ def _agent_decision(agent_idx: int, scenario: str) -> Dict[str, Any]:
     }
 
 
-def run_fake_agents(scenario: str) -> List[Dict[str, Any]]:
-    return [_agent_decision(i, scenario) for i in range(15)]
+def run_fake_agents(scenario: str, market_id: str, tick: int) -> List[Dict[str, Any]]:
+    return [_agent_decision(i, scenario, market_id, tick) for i in range(15)]
 
 
 def aggregate_decision(agent_reports: List[Dict[str, Any]]) -> Dict[str, Any]:
     buys = [a for a in agent_reports if a["vote"] == "BUY"]
     holds = [a for a in agent_reports if a["vote"] != "BUY"]
-
     buy_count = len(buys)
     hold_count = len(holds)
 
@@ -252,42 +287,14 @@ def aggregate_decision(agent_reports: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ============================================================
-# Public latest storage
+# Public storage (base64 JSON)
 # ============================================================
-def _now_ts() -> int:
-    return int(time.time())
-
-
-def _tick_index(ts: int) -> int:
-    # 5-min buckets
-    return int(ts / 300)
-
-
-async def save_public_latest(payload: Dict[str, Any]) -> None:
-    """
-    Сохраняем JSON в KV.
-    Важно: Upstash /set/<key>/<value> использует value в path,
-    поэтому JSON нужно сериализовать и закодировать.
-    Здесь мы используем /set/<key>/<value> напрямую -> это ломается на спецсимволах.
-    Поэтому мы сохраняем через base64 безопаснее.
-    """
-    # безопасно сохраняем JSON как base64, чтобы не ломать URL
-    import base64
-
+def _b64_encode_json(payload: Dict[str, Any]) -> str:
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    b64 = base64.urlsafe_b64encode(raw).decode("utf-8")
-
-    ok = await kv_set(PUBLIC_LATEST_KEY, b64, KV_REST_API_TOKEN)
-    if not ok:
-        raise HTTPException(status_code=500, detail="Failed to persist public:latest")
+    return base64.urlsafe_b64encode(raw).decode("utf-8")
 
 
-async def load_public_latest() -> Optional[Dict[str, Any]]:
-    import base64
-
-    b64 = await kv_get(PUBLIC_LATEST_KEY, KV_REST_API_READ_ONLY_TOKEN)
-    if not b64:
-        return None
+def _b64_decode_json(b64: str) -> Optional[Dict[str, Any]]:
     try:
         raw = base64.urlsafe_b64decode(b64.encode("utf-8"))
         return json.loads(raw.decode("utf-8"))
@@ -295,10 +302,36 @@ async def load_public_latest() -> Optional[Dict[str, Any]]:
         return None
 
 
+async def save_json_key(key: str, payload: Dict[str, Any]) -> None:
+    b64 = _b64_encode_json(payload)
+    ok = await kv_set(key, b64, KV_REST_API_TOKEN)
+    if not ok:
+        raise HTTPException(status_code=500, detail=f"Failed to persist KV key: {key}")
+
+
+async def load_json_key(key: str) -> Optional[Dict[str, Any]]:
+    b64 = await kv_get(key, KV_REST_API_READ_ONLY_TOKEN)
+    if not b64:
+        return None
+    return _b64_decode_json(b64)
+
+
+def market_key(market_id: str) -> str:
+    return f"{PUBLIC_MARKET_KEY_PREFIX}{market_id}"
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def tick_index(ts: int) -> int:
+    return int(ts / 300)  # 5 minutes
+
+
 # ============================================================
 # App
 # ============================================================
-app = FastAPI(title="Polyclawd Executor", version="0.3.0")
+app = FastAPI(title="Polyclawd Executor", version="0.4.0")
 
 
 @app.get("/")
@@ -308,6 +341,7 @@ async def root():
 
 @app.get("/healthz")
 async def healthz():
+    mkts = get_markets()
     return {
         "ok": True,
         "has_executor_secret": bool(EXECUTOR_SECRET),
@@ -315,8 +349,10 @@ async def healthz():
         "has_kv_token": bool(KV_REST_API_TOKEN),
         "lock_key": LOCK_KEY,
         "scenario_key": SCENARIO_KEY,
-        "public_latest_key": PUBLIC_LATEST_KEY,
-        "position_id": POSITION_ID,
+        "public_index_key": PUBLIC_INDEX_KEY,
+        "public_market_key_prefix": PUBLIC_MARKET_KEY_PREFIX,
+        "markets_count": len(mkts),
+        "markets_preview": mkts[:3],
     }
 
 
@@ -334,18 +370,38 @@ async def scenario_post(body: ScenarioBody, _: bool = Depends(require_auth)):
 
 
 # ---------- Public endpoints (no auth) ----------
-@app.get("/public/health")
-async def public_health():
-    latest = await load_public_latest()
-    return {"ok": True, "has_latest": bool(latest), "latest_ts": latest.get("ts") if latest else None}
-
-
 @app.get("/public/latest")
 async def public_latest():
-    latest = await load_public_latest()
-    if not latest:
-        return {"ok": True, "empty": True, "message": "No data yet. Wait for /run to execute at least once."}
-    return {"ok": True, "data": latest}
+    """
+    Отдаёт все 15 карточек одной выдачей (для сайта).
+    """
+    data = await load_json_key(PUBLIC_INDEX_KEY)
+    if not data:
+        return {"ok": True, "empty": True, "message": "No data yet. Run /run at least once."}
+    return {"ok": True, "data": data}
+
+
+@app.get("/public/latest/{market_id}")
+async def public_latest_market(market_id: str = Path(..., description="Market id from MARKETS list")):
+    """
+    Отдаёт одну позицию.
+    """
+    key = market_key(market_id)
+    data = await load_json_key(key)
+    if not data:
+        return {"ok": True, "empty": True, "market_id": market_id, "message": "No data yet for this market."}
+    return {"ok": True, "market_id": market_id, "data": data}
+
+
+@app.get("/public/health")
+async def public_health():
+    idx = await load_json_key(PUBLIC_INDEX_KEY)
+    return {
+        "ok": True,
+        "has_index": bool(idx),
+        "index_ts": idx.get("ts") if idx else None,
+        "index_tick": idx.get("tick") if idx else None,
+    }
 
 
 # ---------- Executor tick ----------
@@ -359,21 +415,46 @@ async def run(_: bool = Depends(require_auth)):
 
     try:
         scenario = await get_scenario()
+        mkts = get_markets()
 
-        agents = run_fake_agents(scenario)
-        summary = aggregate_decision(agents)
+        ts = now_ts()
+        tick = tick_index(ts)
 
-        ts = _now_ts()
-        payload = {
+        # Build results for 15 markets
+        markets_out: List[Dict[str, Any]] = []
+        for market_id in mkts:
+            agents = run_fake_agents(scenario, market_id, tick)
+            summary = aggregate_decision(agents)
+
+            payload_market = {
+                "ts": ts,
+                "tick": tick,
+                "market_id": market_id,
+                "scenario": scenario,
+                "summary": summary,
+                "agents": agents,
+            }
+
+            # Save per-market latest
+            await save_json_key(market_key(market_id), payload_market)
+            markets_out.append(
+                {
+                    "market_id": market_id,
+                    "scenario": scenario,
+                    "summary": summary,
+                    "key": market_key(market_id),
+                }
+            )
+
+        # Save index: everything needed for front
+        payload_index = {
             "ts": ts,
-            "tick": _tick_index(ts),
-            "position_id": POSITION_ID,
+            "tick": tick,
             "scenario": scenario,
-            "summary": summary,
-            "agents": agents,
+            "markets": markets_out,
+            "markets_count": len(markets_out),
         }
-
-        await save_public_latest(payload)
+        await save_json_key(PUBLIC_INDEX_KEY, payload_index)
 
         duration = round(time.time() - started, 3)
         return {
@@ -381,8 +462,10 @@ async def run(_: bool = Depends(require_auth)):
             "skipped": False,
             "message": "tick executed",
             "duration_sec": duration,
-            "saved_to": PUBLIC_LATEST_KEY,
-            "data": payload,
+            "scenario": scenario,
+            "saved_index_to": PUBLIC_INDEX_KEY,
+            "saved_markets": len(markets_out),
+            "markets": markets_out[:3],  # preview
         }
 
     except Exception as e:
