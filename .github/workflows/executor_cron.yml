@@ -2,7 +2,7 @@ name: Executor Cron
 
 on:
   schedule:
-    - cron: "*/1 * * * *"   # каждые 15 минут
+    - cron: "*/5 * * * *"   # каждые 15 минут
   workflow_dispatch:          # чтобы можно было руками запускать
 
 jobs:
