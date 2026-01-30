@@ -603,80 +603,148 @@ def run_agents_for_market(market_id: str, scenario: str, tick: int, presets: Opt
 
 # ----------------------------
 # History per market
+# NOTE: We store history as a Redis LIST (LPUSH + LTRIM + LRANGE)
+# to avoid hitting URL-length limits when writing large JSON arrays.
 # ----------------------------
-async def append_history(market_id: str, item: Dict[str, Any], limit: int = 48) -> None:
-    # храним историю как JSON array в одном ключе, простой MVP
-    key = f"{HISTORY_PREFIX}{market_id}"
-    raw = await upstash_get(key)
-    items = []
-    if raw:
+async def upstash_lpush(key: str, value: str) -> int:
+    """Upstash Redis REST: LPUSH key value"""
+    url = f"{KV_REST_API_URL}/lpush/{quote(key)}/{quote(value)}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(url, headers=_upstash_headers())
+    if r.status_code == 401:
+        raise HTTPException(status_code=500, detail="Upstash 401 Unauthorized: check KV_REST_API_TOKEN")
+    r.raise_for_status()
+    data = r.json()
+    return int(data.get("result", 0) or 0)
+
+
+async def upstash_ltrim(key: str, start: int, stop: int) -> int:
+    """Upstash Redis REST: LTRIM key start stop"""
+    url = f"{KV_REST_API_URL}/ltrim/{quote(key)}/{int(start)}/{int(stop)}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(url, headers=_upstash_headers())
+    if r.status_code == 401:
+        raise HTTPException(status_code=500, detail="Upstash 401 Unauthorized: check KV_REST_API_TOKEN")
+    r.raise_for_status()
+    data = r.json()
+    # Redis returns OK; Upstash may return "OK" or 1 depending on impl
+    res = data.get("result")
+    if isinstance(res, int):
+        return res
+    return 1
+
+
+async def upstash_lrange(key: str, start: int, stop: int) -> List[str]:
+    """Upstash Redis REST: LRANGE key start stop"""
+    url = f"{KV_REST_API_URL}/lrange/{quote(key)}/{int(start)}/{int(stop)}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(url, headers=_upstash_headers())
+    if r.status_code == 401:
+        raise HTTPException(status_code=500, detail="Upstash 401 Unauthorized: check KV_REST_API_TOKEN")
+    r.raise_for_status()
+    data = r.json()
+    res = data.get("result")
+    if res is None:
+        return []
+    if isinstance(res, list):
+        # typically list of strings
+        return [str(x) for x in res]
+    # Backward/edge: if a single string was returned
+    return [str(res)]
+
+
+def _parse_history_payload(raw_items: List[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for raw in raw_items:
+        if not raw:
+            continue
         try:
-            items = json.loads(raw) or []
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                out.append(obj)
         except Exception:
-            items = []
-    items.append(item)
-    if len(items) > limit:
-        items = items[-limit:]
-    await upstash_set(key, json.dumps(items))
+            continue
+    return out
+
+
+async def append_history(market_id: str, item: Dict[str, Any], limit: int = 48) -> None:
+    """Append a history item for market_id, keeping only the most recent `limit` entries."""
+    key = f"{HISTORY_PREFIX}{market_id}"
+
+    # Store compact item to keep each LPUSH payload small.
+    # (Full per-agent payload is heavy and can cause URL-length issues.)
+    compact = dict(item)
+    if "agents" in compact:
+        # keep a tiny sample for debugging/UI, but avoid 15x verbose reasons
+        try:
+            compact["agents_sample"] = (compact.get("agents") or [])[:3]
+        except Exception:
+            compact["agents_sample"] = []
+        compact.pop("agents", None)
+
+    await upstash_lpush(key, json.dumps(compact))
+    # keep newest at head; trim to 0..limit-1
+    await upstash_ltrim(key, 0, max(0, int(limit) - 1))
 
 
 async def get_latest(market_id: str) -> Dict[str, Any]:
     key = f"{HISTORY_PREFIX}{market_id}"
+
+    # Prefer list-based storage
+    items = await upstash_lrange(key, 0, 0)
+    parsed = _parse_history_payload(items)
+    if parsed:
+        return {"ok": True, "market_id": market_id, "data": parsed[0]}
+
+    # Backward compatibility: older storage stored a JSON array at this key
     raw = await upstash_get(key)
     if not raw:
         return {"ok": False, "market_id": market_id, "data": None}
     try:
-        items = json.loads(raw) or []
+        arr = json.loads(raw) or []
     except Exception:
-        items = []
-    if not items:
+        arr = []
+    if not arr:
         return {"ok": False, "market_id": market_id, "data": None}
-    return {"ok": True, "market_id": market_id, "data": items[-1]}
+    return {"ok": True, "market_id": market_id, "data": arr[-1]}
 
 
-async def get_history(market_id: str) -> Dict[str, Any]:
+async def get_history(market_id: str, limit: int = 48) -> Dict[str, Any]:
     key = f"{HISTORY_PREFIX}{market_id}"
+
+    # Prefer list-based storage (newest first)
+    items = await upstash_lrange(key, 0, max(0, int(limit) - 1))
+    parsed = _parse_history_payload(items)
+    if parsed:
+        return {"ok": True, "market_id": market_id, "items": parsed}
+
+    # Backward compatibility: older storage stored a JSON array
     raw = await upstash_get(key)
     if not raw:
         return {"ok": True, "market_id": market_id, "items": []}
     try:
-        items = json.loads(raw) or []
+        arr = json.loads(raw) or []
     except Exception:
-        items = []
-    return {"ok": True, "market_id": market_id, "items": items}
+        arr = []
+    return {"ok": True, "market_id": market_id, "items": arr[-int(limit):] if limit else arr}
 
 
 # ----------------------------
 # Trades (ledger)
+# NOTE: Stored as Redis LIST per market to avoid rewriting large JSON arrays.
 # ----------------------------
 async def append_trade(market_id: str, trade: Dict[str, Any], limit: int = 200) -> None:
-    """Append trade to per-market ledger stored as a JSON array."""
+    """Append trade to per-market ledger stored as a Redis list."""
     key = f"{TRADES_PREFIX}{market_id}"
-    raw = await upstash_get(key)
-    items: List[Dict[str, Any]] = []
-    if raw:
-        try:
-            items = json.loads(raw) or []
-        except Exception:
-            items = []
-
-    items.append(trade)
-    if len(items) > limit:
-        items = items[-limit:]
-
-    await upstash_set(key, json.dumps(items))
+    await upstash_lpush(key, json.dumps(trade))
+    await upstash_ltrim(key, 0, max(0, int(limit) - 1))
 
 
-async def get_trades(market_id: str) -> Dict[str, Any]:
+async def get_trades(market_id: str, limit: int = 200) -> Dict[str, Any]:
     key = f"{TRADES_PREFIX}{market_id}"
-    raw = await upstash_get(key)
-    if not raw:
-        return {"ok": True, "market_id": market_id, "items": []}
-    try:
-        items = json.loads(raw) or []
-    except Exception:
-        items = []
-    return {"ok": True, "market_id": market_id, "items": items}
+    items = await upstash_lrange(key, 0, max(0, int(limit) - 1))
+    parsed = _parse_history_payload(items)
+    return {"ok": True, "market_id": market_id, "items": parsed}
 
 
 async def get_all_trades(limit_per_market: int = 50) -> Dict[str, Any]:
