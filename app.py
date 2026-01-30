@@ -20,11 +20,15 @@ KV_REST_API_TOKEN = os.getenv("KV_REST_API_TOKEN", "AYCOAAIncDI5OTM2N2MzOTBiNGE0
 LOCK_KEY = os.getenv("EXECUTOR_LOCK_KEY", "executor:lock")
 LOCK_TTL_SECONDS = int(os.getenv("EXECUTOR_LOCK_TTL_SECONDS", "60"))
 
+#
 # trading demo settings
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
 MAX_TRADE_FRACTION = float(os.getenv("MAX_TRADE_FRACTION", "0.10"))  # 10% of portfolio value
 EXIT_CONFIDENCE_THRESHOLD = float(os.getenv("EXIT_CONFIDENCE_THRESHOLD", "0.55"))
 STARTING_CASH = float(os.getenv("STARTING_CASH", "250"))
+# Minimum holding period (in ticks) before a position can be closed
+MIN_HOLD_TICKS = int(os.getenv("MIN_HOLD_TICKS", "2"))  # minimum ticks to hold a position before allowing exit
+EMERGENCY_EXIT_CONFIDENCE = float(os.getenv("EMERGENCY_EXIT_CONFIDENCE", "0.90"))  # allow early exit if SELL confidence >= this
 
 # demo markets
 MARKETS = os.getenv("MARKETS", "POLY:DEMO_001,POLY:DEMO_002,POLY:DEMO_003,POLY:DEMO_004,POLY:DEMO_005,POLY:DEMO_006").split(",")
@@ -527,6 +531,8 @@ async def healthz():
         "markets": MARKETS,
         "max_open_positions": MAX_OPEN_POSITIONS,
         "max_trade_fraction": MAX_TRADE_FRACTION,
+        "min_hold_ticks": MIN_HOLD_TICKS,
+        "emergency_exit_confidence": EMERGENCY_EXIT_CONFIDENCE,
     }
 
 
@@ -681,13 +687,33 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             decision = a["summary"].get("decision")
             avg_conf = float(a["summary"].get("avg_confidence", 0))
 
-            if decision == "SELL":
-                qty = float(positions[mid].get("qty_usd", 0))
+            pos = positions.get(mid) or {}
+            opened_tick = pos.get("opened_tick")
+            if opened_tick is None:
+                # Backward-compat: infer from opened_ts if present
+                try:
+                    opened_ts = int(pos.get("opened_ts") or 0)
+                except Exception:
+                    opened_ts = 0
+                opened_tick = int(opened_ts // 900) if opened_ts else tick
+
+            age_ticks = max(0, int(tick) - int(opened_tick))
+            too_young_to_exit = age_ticks < MIN_HOLD_TICKS
+            emergency_exit = (decision == "SELL") and (avg_conf >= EMERGENCY_EXIT_CONFIDENCE)
+
+            wants_exit = (decision == "SELL") or (avg_conf <= EXIT_CONFIDENCE_THRESHOLD)
+
+            if wants_exit and too_young_to_exit and not emergency_exit:
+                # Block early exits to reduce churn
+                # (we'll surface this via execution.reason)
+                pass
+            elif decision == "SELL":
+                qty = float(pos.get("qty_usd", 0))
                 cash += qty
                 del positions[mid]
                 closed_positions.append(mid)
             elif avg_conf <= EXIT_CONFIDENCE_THRESHOLD:
-                qty = float(positions[mid].get("qty_usd", 0))
+                qty = float(pos.get("qty_usd", 0))
                 cash += qty
                 del positions[mid]
                 closed_positions.append(mid)
@@ -717,7 +743,12 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             if qty <= 0:
                 open_skip_reason[mid] = "trade size <= 0"
                 break
-            positions[mid] = {"market_id": mid, "qty_usd": round(qty, 2), "opened_ts": int(time.time())}
+            positions[mid] = {
+                "market_id": mid,
+                "qty_usd": round(qty, 2),
+                "opened_ts": int(time.time()),
+                "opened_tick": tick,
+            }
             cash -= qty
             opened_positions.append(mid)
 
@@ -735,6 +766,29 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
 
             was_in_position = mid in positions_before
             is_in_position = mid in positions_after
+
+            age_ticks = None
+            age_minutes = None
+            exit_blocked = False
+
+            if was_in_position:
+                pos = positions_before.get(mid) or {}
+                opened_tick = pos.get("opened_tick")
+                if opened_tick is None:
+                    try:
+                        opened_ts = int(pos.get("opened_ts") or 0)
+                    except Exception:
+                        opened_ts = 0
+                    opened_tick = int(opened_ts // 900) if opened_ts else tick
+
+                age_ticks = max(0, int(tick) - int(opened_tick))
+                age_minutes = int(age_ticks * 15)
+
+                # If we still have the position but the strategy wanted to exit, it may have been blocked
+                wants_exit = (decision == "SELL") or (avg_conf <= EXIT_CONFIDENCE_THRESHOLD)
+                too_young_to_exit = age_ticks < MIN_HOLD_TICKS
+                emergency_exit = (decision == "SELL") and (avg_conf >= EMERGENCY_EXIT_CONFIDENCE)
+                exit_blocked = bool(wants_exit and too_young_to_exit and not emergency_exit and is_in_position)
 
             # INTENT: what the strategy wanted to do (separate from what actually happened)
             if was_in_position:
@@ -765,7 +819,10 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
                 reason = "opened due to BUY"
             else:
                 # No portfolio change on this market
-                if intent == "ADD" and is_in_position:
+                if exit_blocked:
+                    action = "NONE"
+                    reason = f"exit blocked: position too young (min_hold_ticks={MIN_HOLD_TICKS})"
+                elif intent == "ADD" and is_in_position:
                     action = "NONE"
                     reason = "scaling not implemented (ADD disabled)"
                 elif intent == "OPEN" and not is_in_position:
@@ -774,6 +831,7 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
                 elif intent == "EXIT" and was_in_position and is_in_position:
                     action = "NONE"
                     reason = "exit conditions not met"
+
                 # Ensure UI always gets a meaningful explanation when nothing happens
                 if action == "NONE" and not reason:
                     if decision == "SELL" and not was_in_position:
@@ -793,6 +851,9 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
                 "reason": reason,
                 "decision": decision,
                 "avg_confidence": avg_conf,
+                "age_ticks": age_ticks,
+                "age_minutes": age_minutes,
+                "exit_blocked": exit_blocked,
             }
 
         # 5) write histories (per market)
