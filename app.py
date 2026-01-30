@@ -271,6 +271,99 @@ def portfolio_value(p: Dict[str, Any]) -> float:
     return round(cash + pos_total, 6)
 
 
+# ---- Portfolio View Helpers ----
+
+def _current_tick() -> int:
+    # 15-minute ticks
+    return int(time.time() // 900)
+
+
+def _position_view(pos: Dict[str, Any], last_price: float, tick: int) -> Dict[str, Any]:
+    """Normalize a position dict and compute frontend-friendly fields."""
+    # Backward compat: migrate old positions (qty_usd -> shares/cost_basis)
+    last_price = float(last_price or 0.5)
+    last_price = _clamp(last_price)
+
+    entry_price = pos.get("entry_price")
+    if entry_price is None:
+        entry_price = last_price
+    try:
+        entry_price = float(entry_price)
+    except Exception:
+        entry_price = last_price
+    entry_price = _clamp(entry_price)
+
+    # shares / cost basis
+    shares = pos.get("shares")
+    cost_basis = pos.get("cost_basis_usd")
+
+    # migrate from old fields if needed
+    if shares is None or cost_basis is None:
+        try:
+            qty_usd = float(pos.get("qty_usd", 0) or 0)
+        except Exception:
+            qty_usd = 0.0
+        cost_basis = float(cost_basis or qty_usd or 0.0)
+        shares = float(shares or (qty_usd / entry_price if entry_price > 0 else 0.0) or 0.0)
+
+    try:
+        shares = float(shares or 0.0)
+    except Exception:
+        shares = 0.0
+    try:
+        cost_basis = float(cost_basis or 0.0)
+    except Exception:
+        cost_basis = 0.0
+
+    # opened info
+    opened_ts = pos.get("opened_ts")
+    try:
+        opened_ts_int = int(opened_ts or 0)
+    except Exception:
+        opened_ts_int = 0
+
+    opened_tick = pos.get("opened_tick")
+    if opened_tick is None:
+        opened_tick = int(opened_ts_int // 900) if opened_ts_int else tick
+    try:
+        opened_tick_int = int(opened_tick)
+    except Exception:
+        opened_tick_int = tick
+
+    age_ticks = max(0, int(tick) - int(opened_tick_int))
+    age_minutes = int(age_ticks * 15)
+
+    value = shares * last_price
+    unreal = value - cost_basis
+    pnl_pct = (unreal / cost_basis * 100.0) if cost_basis > 0 else 0.0
+
+    return {
+        "market_id": pos.get("market_id"),
+        "shares": round(shares, 8),
+        "entry_price": round(entry_price, 6),
+        "last_price": round(last_price, 6),
+        "cost_basis_usd": round(cost_basis, 6),
+        "position_value_usd": round(value, 6),
+        "unrealized_pnl_usd": round(unreal, 6),
+        "unrealized_pnl_pct": round(pnl_pct, 4),
+        "opened_ts": opened_ts_int or None,
+        "opened_tick": opened_tick_int,
+        "age_ticks": age_ticks,
+        "age_minutes": age_minutes,
+    }
+
+
+def build_positions_view(p: Dict[str, Any], scenario: str, tick: int) -> Dict[str, Any]:
+    """Return a dict market_id -> computed position view (only for open positions)."""
+    positions = p.get("positions") or {}
+    out: Dict[str, Any] = {}
+    for mid, pos in positions.items():
+        px = market_price(mid, scenario, tick)
+        out[mid] = _position_view(pos or {"market_id": mid}, px, tick)
+        out[mid]["market_id"] = mid
+    return out
+
+
 # ----------------------------
 # Presets (optional)
 # Structure expected (JSON):
@@ -664,7 +757,21 @@ async def public_trades_all(limit_per_market: int = 50):
 @app.get("/public/portfolio")
 async def public_portfolio():
     p = await load_portfolio()
-    return {"ok": True, "portfolio": p, "value": portfolio_value(p)}
+    scenario = await get_scenario()
+    tick = _current_tick()
+
+    positions_view = build_positions_view(p, scenario=scenario, tick=tick)
+
+    return {
+        "ok": True,
+        "scenario": scenario,
+        "tick": tick,
+        "portfolio": p,
+        "positions_view": positions_view,
+        "value": portfolio_value(p),
+        "ts": int(time.time()),
+        "ts_ms": int(time.time() * 1000),
+    }
 
 
 # ---- Inserted endpoints ----
@@ -681,17 +788,22 @@ async def public_snapshot():
     scenario = await get_scenario()
     p = await load_portfolio()
 
+    tick = _current_tick()
+    positions_view = build_positions_view(p, scenario=scenario, tick=tick)
+
     latest_by_market: Dict[str, Any] = {}
     for m in MARKETS:
         latest_by_market[m] = await get_latest(m)
 
-    scenario_prices: Dict[str, float] = {m: market_price(m, scenario, int(time.time() // 900)) for m in MARKETS}
+    scenario_prices: Dict[str, float] = {m: market_price(m, scenario, tick) for m in MARKETS}
 
     return {
         "ok": True,
         "scenario": scenario,
         "markets": MARKETS,
         "portfolio": p,
+        "tick": tick,
+        "positions_view": positions_view,
         "value": portfolio_value(p),
         "latest": latest_by_market,
         "prices": scenario_prices,
