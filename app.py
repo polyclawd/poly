@@ -606,36 +606,52 @@ def run_agents_for_market(market_id: str, scenario: str, tick: int, presets: Opt
 # NOTE: We store history as a Redis LIST (LPUSH + LTRIM + LRANGE)
 # to avoid hitting URL-length limits when writing large JSON arrays.
 # ----------------------------
-async def upstash_lpush(key: str, value: str) -> int:
-    """Upstash Redis REST: LPUSH key value"""
-    url = f"{KV_REST_API_URL}/lpush/{quote(key)}/{quote(value)}"
+async def upstash_pipeline(commands: List[List[Any]]) -> Any:
+    """Upstash Redis REST: POST /pipeline with JSON body to avoid URL length limits."""
+    if not KV_REST_API_URL or not KV_REST_API_TOKEN:
+        raise HTTPException(status_code=500, detail="Server misconfigured: KV_REST_API_URL / KV_REST_API_TOKEN is empty")
+
+    url = f"{KV_REST_API_URL}/pipeline"
+    headers = dict(_upstash_headers())
+    headers["Content-Type"] = "application/json"
+
     async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.post(url, headers=_upstash_headers())
+        r = await client.post(url, headers=headers, json=commands)
+
     if r.status_code == 401:
         raise HTTPException(status_code=500, detail="Upstash 401 Unauthorized: check KV_REST_API_TOKEN")
+
     r.raise_for_status()
-    data = r.json()
-    return int(data.get("result", 0) or 0)
+    return r.json()
+
+
+async def upstash_lpush(key: str, value: str) -> int:
+    """Upstash Redis REST: LPUSH key value (via pipeline to avoid URL-length limits)."""
+    data = await upstash_pipeline([["LPUSH", key, value]])
+    res = data.get("result")
+    # Upstash returns a list of results for pipeline
+    if isinstance(res, list) and res:
+        try:
+            return int(res[0].get("result", 0) if isinstance(res[0], dict) else res[0])
+        except Exception:
+            return 0
+    try:
+        return int(res or 0)
+    except Exception:
+        return 0
 
 
 async def upstash_ltrim(key: str, start: int, stop: int) -> int:
-    """Upstash Redis REST: LTRIM key start stop"""
-    url = f"{KV_REST_API_URL}/ltrim/{quote(key)}/{int(start)}/{int(stop)}"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.post(url, headers=_upstash_headers())
-    if r.status_code == 401:
-        raise HTTPException(status_code=500, detail="Upstash 401 Unauthorized: check KV_REST_API_TOKEN")
-    r.raise_for_status()
-    data = r.json()
-    # Redis returns OK; Upstash may return "OK" or 1 depending on impl
+    """Upstash Redis REST: LTRIM key start stop (via pipeline)."""
+    data = await upstash_pipeline([["LTRIM", key, str(int(start)), str(int(stop))]])
     res = data.get("result")
-    if isinstance(res, int):
-        return res
+    if isinstance(res, list) and res:
+        return 1
     return 1
 
 
 async def upstash_lrange(key: str, start: int, stop: int) -> List[str]:
-    """Upstash Redis REST: LRANGE key start stop"""
+    """Upstash Redis REST: LRANGE key start stop (read URL is short, safe)."""
     url = f"{KV_REST_API_URL}/lrange/{quote(key)}/{int(start)}/{int(stop)}"
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.get(url, headers=_upstash_headers())
@@ -647,9 +663,7 @@ async def upstash_lrange(key: str, start: int, stop: int) -> List[str]:
     if res is None:
         return []
     if isinstance(res, list):
-        # typically list of strings
         return [str(x) for x in res]
-    # Backward/edge: if a single string was returned
     return [str(res)]
 
 
@@ -682,9 +696,11 @@ async def append_history(market_id: str, item: Dict[str, Any], limit: int = 48) 
             compact["agents_sample"] = []
         compact.pop("agents", None)
 
-    await upstash_lpush(key, json.dumps(compact))
-    # keep newest at head; trim to 0..limit-1
-    await upstash_ltrim(key, 0, max(0, int(limit) - 1))
+    payload = json.dumps(compact)
+    await upstash_pipeline([
+        ["LPUSH", key, payload],
+        ["LTRIM", key, "0", str(max(0, int(limit) - 1))],
+    ])
 
 
 async def get_latest(market_id: str) -> Dict[str, Any]:
@@ -736,8 +752,11 @@ async def get_history(market_id: str, limit: int = 48) -> Dict[str, Any]:
 async def append_trade(market_id: str, trade: Dict[str, Any], limit: int = 200) -> None:
     """Append trade to per-market ledger stored as a Redis list."""
     key = f"{TRADES_PREFIX}{market_id}"
-    await upstash_lpush(key, json.dumps(trade))
-    await upstash_ltrim(key, 0, max(0, int(limit) - 1))
+    payload = json.dumps(trade)
+    await upstash_pipeline([
+        ["LPUSH", key, payload],
+        ["LTRIM", key, "0", str(max(0, int(limit) - 1))],
+    ])
 
 
 async def get_trades(market_id: str, limit: int = 200) -> Dict[str, Any]:
