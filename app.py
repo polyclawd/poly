@@ -47,7 +47,11 @@ PRESETS_KEY = os.getenv("PRESETS_KEY", "executor:presets")
 AGENTS_PRESET_JSON = os.getenv("AGENTS_PRESET_JSON", "")
 
 TRADES_PREFIX = os.getenv("TRADES_PREFIX", "executor:trades:")
-RUNS_KEY = os.getenv("RUNS_KEY", "executor:runs")
+
+# Tick mode config
+TICK_MODE_KEY = os.getenv("TICK_MODE_KEY", "executor:tick_mode")  # "real" or "sim"
+SIM_TICK_KEY = os.getenv("SIM_TICK_KEY", "executor:sim_tick")
+DEFAULT_TICK_MODE = os.getenv("DEFAULT_TICK_MODE", "real").strip().lower() or "real"
 
 
 # ----------------------------
@@ -202,6 +206,59 @@ async def set_scenario(s: str) -> str:
 
 
 # ----------------------------
+# Tick mode (real vs sim)
+# ----------------------------
+VALID_TICK_MODES = {"real", "sim"}
+
+
+async def get_tick_mode() -> str:
+    m = await upstash_get(TICK_MODE_KEY)
+    if not m:
+        m = DEFAULT_TICK_MODE
+    m = str(m).strip().lower()
+    if m not in VALID_TICK_MODES:
+        return "real"
+    return m
+
+
+async def set_tick_mode(mode: str) -> str:
+    mode = (mode or "").strip().lower()
+    if mode not in VALID_TICK_MODES:
+        raise HTTPException(status_code=422, detail=f"Invalid tick mode. Use one of: {sorted(VALID_TICK_MODES)}")
+    await upstash_set(TICK_MODE_KEY, mode)
+    return mode
+
+
+async def get_sim_tick() -> int:
+    raw = await upstash_get(SIM_TICK_KEY)
+    if raw is None or raw == "":
+        # initialize sim tick to current real tick
+        t = int(time.time() // 900)
+        await upstash_set(SIM_TICK_KEY, str(t))
+        return t
+    try:
+        return int(raw)
+    except Exception:
+        t = int(time.time() // 900)
+        await upstash_set(SIM_TICK_KEY, str(t))
+        return t
+
+
+async def set_sim_tick(tick: int) -> int:
+    t = int(tick)
+    await upstash_set(SIM_TICK_KEY, str(t))
+    return t
+
+
+async def advance_sim_tick(delta: int = 1) -> int:
+    cur = await get_sim_tick()
+    nxt = int(cur) + int(delta)
+    await upstash_set(SIM_TICK_KEY, str(nxt))
+    return nxt
+
+
+# ----------------------------
+#
 # Portfolio state
 # ----------------------------
 def _portfolio_default() -> Dict[str, Any]:
@@ -275,8 +332,15 @@ def portfolio_value(p: Dict[str, Any]) -> float:
 
 # ---- Portfolio View Helpers ----
 
-def _current_tick() -> int:
-    # 15-minute ticks
+
+# ----------------------------
+# Current tick (real vs sim)
+# ----------------------------
+async def current_tick() -> int:
+    """Return current tick depending on mode (real time vs simulated)."""
+    mode = await get_tick_mode()
+    if mode == "sim":
+        return await get_sim_tick()
     return int(time.time() // 900)
 
 
@@ -683,31 +747,6 @@ def _parse_history_payload(raw_items: List[str]) -> List[Dict[str, Any]]:
     return out
 
 
-# ---- Global run log helpers ----
-async def append_run_log(item: Dict[str, Any], limit: int = 200) -> None:
-    """Append a compact run log item to a global Redis list."""
-    payload = json.dumps(item)
-    await upstash_pipeline([
-        ["LPUSH", RUNS_KEY, payload],
-        ["LTRIM", RUNS_KEY, "0", str(max(0, int(limit) - 1))],
-    ])
-
-
-async def get_runs(limit: int = 20) -> List[Dict[str, Any]]:
-    """Return newest-first run logs."""
-    items = await upstash_lrange(RUNS_KEY, 0, max(0, int(limit) - 1))
-    return _parse_history_payload(items)
-
-
-async def lock_status() -> Dict[str, Any]:
-    """Return whether the executor lock is currently present."""
-    try:
-        v = await upstash_get(LOCK_KEY)
-    except Exception:
-        v = None
-    return {"present": bool(v), "value": v}
-
-
 async def append_history(market_id: str, item: Dict[str, Any], limit: int = 48) -> None:
     """Append a history item for market_id, keeping only the most recent `limit` entries."""
     key = f"{HISTORY_PREFIX}{market_id}"
@@ -872,7 +911,7 @@ async def public_trades_all(limit_per_market: int = 50):
 async def public_portfolio():
     p = await load_portfolio()
     scenario = await get_scenario()
-    tick = _current_tick()
+    tick = await current_tick()
 
     positions_view = build_positions_view(p, scenario=scenario, tick=tick)
 
@@ -885,41 +924,6 @@ async def public_portfolio():
         "value": portfolio_value(p),
         "ts": int(time.time()),
         "ts_ms": int(time.time() * 1000),
-    }
-
-
-# ---- Public status endpoint ----
-@app.get("/public/status")
-async def public_status():
-    """Health/status for ops + frontend debugging."""
-    now_ts = int(time.time())
-    now_ms = int(time.time() * 1000)
-    current_tick = _current_tick()
-
-    p = await load_portfolio()
-    last_tick = p.get("last_tick")
-    minutes_since_last_tick = None
-    if last_tick is not None:
-        try:
-            minutes_since_last_tick = int((current_tick - int(last_tick)) * 15)
-        except Exception:
-            minutes_since_last_tick = None
-
-    runs = await get_runs(limit=10)
-    last_run = runs[0] if runs else None
-
-    lstat = await lock_status()
-
-    return {
-        "ok": True,
-        "now_ts": now_ts,
-        "now_ms": now_ms,
-        "current_tick": current_tick,
-        "portfolio_last_tick": last_tick,
-        "minutes_since_last_tick": minutes_since_last_tick,
-        "last_run": last_run,
-        "recent_runs": runs,
-        "lock": lstat,
     }
 
 
@@ -937,7 +941,7 @@ async def public_snapshot():
     scenario = await get_scenario()
     p = await load_portfolio()
 
-    tick = _current_tick()
+    tick = await current_tick()
     positions_view = build_positions_view(p, scenario=scenario, tick=tick)
 
     latest_by_market: Dict[str, Any] = {}
@@ -1001,27 +1005,11 @@ async def admin_presets_post(body: Dict[str, Any], _: bool = Depends(require_aut
 
 
 
-async def _execute_run(force: bool = False, run_mode: str = "manual") -> Dict[str, Any]:
+async def _execute_run(force: bool = False) -> Dict[str, Any]:
     """Shared run implementation used by authenticated /run and token-based cron endpoint."""
     started = time.time()
     lock_id = await try_lock()
     if not lock_id:
-        item = {
-            "ts": int(time.time()),
-            "ts_ms": int(time.time() * 1000),
-            "tick": _current_tick(),
-            "scenario": await get_scenario(),
-            "run_id": None,
-            "run_mode": run_mode,
-            "forced": bool(force),
-            "skipped": True,
-            "reason": "locked",
-            "message": "Another run is in progress",
-        }
-        try:
-            await append_run_log(item)
-        except Exception:
-            pass
         return {"ok": True, "skipped": True, "reason": "locked", "message": "Another run is in progress"}
 
     try:
@@ -1029,8 +1017,13 @@ async def _execute_run(force: bool = False, run_mode: str = "manual") -> Dict[st
         presets = await load_presets()
         p = await load_portfolio()
 
-        # tick increments (demo): based on unix time / 900 sec (15 min)
-        tick = int(time.time() // 900)
+        # tick selection depends on mode
+        mode = await get_tick_mode()
+        if mode == "sim":
+            # In sim mode, each run advances the tick by 1 unless this run is skipped.
+            tick = await advance_sim_tick(1)
+        else:
+            tick = int(time.time() // 900)
         run_id = str(uuid.uuid4())
 
         def _trade_base(mid: str) -> Dict[str, Any]:
@@ -1047,23 +1040,6 @@ async def _execute_run(force: bool = False, run_mode: str = "manual") -> Dict[st
         # (use ?force=true to override for manual testing)
         if not force and p.get("last_tick") == tick:
             duration = round(time.time() - started, 3)
-            item = {
-                "ts": int(time.time()),
-                "ts_ms": int(time.time() * 1000),
-                "tick": tick,
-                "scenario": scenario,
-                "run_id": None,
-                "run_mode": run_mode,
-                "forced": False,
-                "skipped": True,
-                "reason": "same_tick",
-                "duration_sec": duration,
-                "portfolio": {"cash": p.get("cash"), "open_positions": len(p.get("positions", {}) or {})},
-            }
-            try:
-                await append_run_log(item)
-            except Exception:
-                pass
             return {
                 "ok": True,
                 "skipped": True,
@@ -1071,11 +1047,10 @@ async def _execute_run(force: bool = False, run_mode: str = "manual") -> Dict[st
                 "message": "Already executed this tick (use force=true to override)",
                 "tick": tick,
                 "scenario": scenario,
-                "run_mode": run_mode,
-                "forced": False,
                 "ts_ms": int(time.time() * 1000),
                 "portfolio": {"cash": p.get("cash"), "open_positions": len(p.get("positions", {}) or {})},
                 "duration_sec": duration,
+                "tick_mode": await get_tick_mode(),
             }
 
         # 1) analyze all markets
@@ -1451,33 +1426,11 @@ async def _execute_run(force: bool = False, run_mode: str = "manual") -> Dict[st
                     "equity": portfolio_value(p),
                 },
                 "agents": a["agents"],
+                "tick_mode": mode,
             }
             await append_history(mid, item)
 
         duration = round(time.time() - started, 3)
-        run_log_item = {
-            "ts": int(time.time()),
-            "ts_ms": int(time.time() * 1000),
-            "tick": tick,
-            "scenario": scenario,
-            "run_id": run_id,
-            "run_mode": run_mode,
-            "forced": bool(force),
-            "skipped": False,
-            "duration_sec": duration,
-            "portfolio": {"cash": p["cash"], "open_positions": len(p["positions"])},
-            "execution_summary": {
-                "opened": opened_positions,
-                "closed": closed_positions,
-                "reduced": reduced_positions,
-                "open_skipped": open_skip_reason,
-            },
-        }
-        try:
-            await append_run_log(run_log_item)
-        except Exception:
-            pass
-
         return {
             "ok": True,
             "skipped": False,
@@ -1485,8 +1438,6 @@ async def _execute_run(force: bool = False, run_mode: str = "manual") -> Dict[st
             "tick": tick,
             "scenario": scenario,
             "run_id": run_id,
-            "run_mode": run_mode,
-            "forced": bool(force),
             "ts_ms": int(time.time() * 1000),
             "portfolio": {"cash": p["cash"], "open_positions": len(p["positions"])},
             "execution_summary": {
@@ -1495,7 +1446,43 @@ async def _execute_run(force: bool = False, run_mode: str = "manual") -> Dict[st
                 "open_skipped": open_skip_reason,
             },
             "duration_sec": duration,
+            "tick_mode": mode,
         }
+
+
+# ---- Tick mode admin endpoint ----
+
+@app.post("/admin/tick")
+async def admin_tick(body: Dict[str, Any], _: bool = Depends(require_auth)):
+    """Control tick mode and simulated tick.
+
+    Payload examples:
+      {"mode": "sim"}              -> enable sim mode
+      {"mode": "real"}             -> enable real mode
+      {"set": 12345}               -> set sim tick
+      {"advance": 5}               -> advance sim tick by N
+    """
+    mode = body.get("mode")
+    set_to = body.get("set")
+    adv = body.get("advance")
+
+    out: Dict[str, Any] = {"ok": True}
+
+    if mode is not None:
+        out["tick_mode"] = await set_tick_mode(str(mode))
+    else:
+        out["tick_mode"] = await get_tick_mode()
+
+    # Only meaningful in sim mode, but we allow setting anyway
+    if set_to is not None:
+        out["sim_tick"] = await set_sim_tick(int(set_to))
+    elif adv is not None:
+        out["sim_tick"] = await advance_sim_tick(int(adv))
+    else:
+        out["sim_tick"] = await get_sim_tick()
+
+    out["current_tick"] = await current_tick()
+    return out
 
     finally:
         try:
@@ -1504,28 +1491,13 @@ async def _execute_run(force: bool = False, run_mode: str = "manual") -> Dict[st
             pass
 
 
-from fastapi import Body
-
 @app.post("/run")
-async def run(
-    force: bool = False,
-    body: Optional[Dict[str, Any]] = Body(default=None),
-    _: bool = Depends(require_auth),
-):
-    """Run one tick. Accepts `force` as query param and/or JSON body to be frontend-friendly."""
-    force_body = False
-    if isinstance(body, dict):
-        try:
-            force_body = bool(body.get("force"))
-        except Exception:
-            force_body = False
-
-    force_final = bool(force) or bool(force_body)
-
+async def run(force: bool = False, _: bool = Depends(require_auth)):
     try:
-        return await _execute_run(force=force_final, run_mode="manual")
+        return await _execute_run(force=force)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Executor error: {type(e).__name__}: {e}") from e
+
 
 
 # Cron-friendly endpoint for Render/other schedulers
@@ -1540,6 +1512,22 @@ async def cron_run(token: str, force: bool = False):
     if token != EXECUTOR_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
-        return await _execute_run(force=force, run_mode="cron")
+        return await _execute_run(force=force)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Executor error: {type(e).__name__}: {e}") from e
+
+
+# ---- Public status endpoint (tick mode surfaced) ----
+@app.get("/public/status")
+async def public_status():
+    scenario = await get_scenario()
+    current_tick_val = await current_tick()
+    return {
+        "ok": True,
+        "scenario": scenario,
+        "current_tick": current_tick_val,
+        "tick_mode": await get_tick_mode(),
+        "sim_tick": await get_sim_tick(),
+        "ts": int(time.time()),
+        "ts_ms": int(time.time() * 1000),
+    }
