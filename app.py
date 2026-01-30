@@ -45,7 +45,9 @@ PORTFOLIO_KEY = os.getenv("PORTFOLIO_KEY", "executor:portfolio")
 HISTORY_PREFIX = os.getenv("HISTORY_PREFIX", "executor:history:")
 PRESETS_KEY = os.getenv("PRESETS_KEY", "executor:presets")
 AGENTS_PRESET_JSON = os.getenv("AGENTS_PRESET_JSON", "")
+
 TRADES_PREFIX = os.getenv("TRADES_PREFIX", "executor:trades:")
+RUNS_KEY = os.getenv("RUNS_KEY", "executor:runs")
 
 
 # ----------------------------
@@ -681,6 +683,31 @@ def _parse_history_payload(raw_items: List[str]) -> List[Dict[str, Any]]:
     return out
 
 
+# ---- Global run log helpers ----
+async def append_run_log(item: Dict[str, Any], limit: int = 200) -> None:
+    """Append a compact run log item to a global Redis list."""
+    payload = json.dumps(item)
+    await upstash_pipeline([
+        ["LPUSH", RUNS_KEY, payload],
+        ["LTRIM", RUNS_KEY, "0", str(max(0, int(limit) - 1))],
+    ])
+
+
+async def get_runs(limit: int = 20) -> List[Dict[str, Any]]:
+    """Return newest-first run logs."""
+    items = await upstash_lrange(RUNS_KEY, 0, max(0, int(limit) - 1))
+    return _parse_history_payload(items)
+
+
+async def lock_status() -> Dict[str, Any]:
+    """Return whether the executor lock is currently present."""
+    try:
+        v = await upstash_get(LOCK_KEY)
+    except Exception:
+        v = None
+    return {"present": bool(v), "value": v}
+
+
 async def append_history(market_id: str, item: Dict[str, Any], limit: int = 48) -> None:
     """Append a history item for market_id, keeping only the most recent `limit` entries."""
     key = f"{HISTORY_PREFIX}{market_id}"
@@ -861,6 +888,41 @@ async def public_portfolio():
     }
 
 
+# ---- Public status endpoint ----
+@app.get("/public/status")
+async def public_status():
+    """Health/status for ops + frontend debugging."""
+    now_ts = int(time.time())
+    now_ms = int(time.time() * 1000)
+    current_tick = _current_tick()
+
+    p = await load_portfolio()
+    last_tick = p.get("last_tick")
+    minutes_since_last_tick = None
+    if last_tick is not None:
+        try:
+            minutes_since_last_tick = int((current_tick - int(last_tick)) * 15)
+        except Exception:
+            minutes_since_last_tick = None
+
+    runs = await get_runs(limit=10)
+    last_run = runs[0] if runs else None
+
+    lstat = await lock_status()
+
+    return {
+        "ok": True,
+        "now_ts": now_ts,
+        "now_ms": now_ms,
+        "current_tick": current_tick,
+        "portfolio_last_tick": last_tick,
+        "minutes_since_last_tick": minutes_since_last_tick,
+        "last_run": last_run,
+        "recent_runs": runs,
+        "lock": lstat,
+    }
+
+
 # ---- Inserted endpoints ----
 
 @app.get("/public/markets")
@@ -939,11 +1001,27 @@ async def admin_presets_post(body: Dict[str, Any], _: bool = Depends(require_aut
 
 
 
-async def _execute_run(force: bool = False) -> Dict[str, Any]:
+async def _execute_run(force: bool = False, run_mode: str = "manual") -> Dict[str, Any]:
     """Shared run implementation used by authenticated /run and token-based cron endpoint."""
     started = time.time()
     lock_id = await try_lock()
     if not lock_id:
+        item = {
+            "ts": int(time.time()),
+            "ts_ms": int(time.time() * 1000),
+            "tick": _current_tick(),
+            "scenario": await get_scenario(),
+            "run_id": None,
+            "run_mode": run_mode,
+            "forced": bool(force),
+            "skipped": True,
+            "reason": "locked",
+            "message": "Another run is in progress",
+        }
+        try:
+            await append_run_log(item)
+        except Exception:
+            pass
         return {"ok": True, "skipped": True, "reason": "locked", "message": "Another run is in progress"}
 
     try:
@@ -969,6 +1047,23 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
         # (use ?force=true to override for manual testing)
         if not force and p.get("last_tick") == tick:
             duration = round(time.time() - started, 3)
+            item = {
+                "ts": int(time.time()),
+                "ts_ms": int(time.time() * 1000),
+                "tick": tick,
+                "scenario": scenario,
+                "run_id": None,
+                "run_mode": run_mode,
+                "forced": False,
+                "skipped": True,
+                "reason": "same_tick",
+                "duration_sec": duration,
+                "portfolio": {"cash": p.get("cash"), "open_positions": len(p.get("positions", {}) or {})},
+            }
+            try:
+                await append_run_log(item)
+            except Exception:
+                pass
             return {
                 "ok": True,
                 "skipped": True,
@@ -976,6 +1071,8 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
                 "message": "Already executed this tick (use force=true to override)",
                 "tick": tick,
                 "scenario": scenario,
+                "run_mode": run_mode,
+                "forced": False,
                 "ts_ms": int(time.time() * 1000),
                 "portfolio": {"cash": p.get("cash"), "open_positions": len(p.get("positions", {}) or {})},
                 "duration_sec": duration,
@@ -1358,6 +1455,29 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             await append_history(mid, item)
 
         duration = round(time.time() - started, 3)
+        run_log_item = {
+            "ts": int(time.time()),
+            "ts_ms": int(time.time() * 1000),
+            "tick": tick,
+            "scenario": scenario,
+            "run_id": run_id,
+            "run_mode": run_mode,
+            "forced": bool(force),
+            "skipped": False,
+            "duration_sec": duration,
+            "portfolio": {"cash": p["cash"], "open_positions": len(p["positions"])},
+            "execution_summary": {
+                "opened": opened_positions,
+                "closed": closed_positions,
+                "reduced": reduced_positions,
+                "open_skipped": open_skip_reason,
+            },
+        }
+        try:
+            await append_run_log(run_log_item)
+        except Exception:
+            pass
+
         return {
             "ok": True,
             "skipped": False,
@@ -1365,6 +1485,8 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             "tick": tick,
             "scenario": scenario,
             "run_id": run_id,
+            "run_mode": run_mode,
+            "forced": bool(force),
             "ts_ms": int(time.time() * 1000),
             "portfolio": {"cash": p["cash"], "open_positions": len(p["positions"])},
             "execution_summary": {
@@ -1382,10 +1504,26 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             pass
 
 
+from fastapi import Body
+
 @app.post("/run")
-async def run(force: bool = False, _: bool = Depends(require_auth)):
+async def run(
+    force: bool = False,
+    body: Optional[Dict[str, Any]] = Body(default=None),
+    _: bool = Depends(require_auth),
+):
+    """Run one tick. Accepts `force` as query param and/or JSON body to be frontend-friendly."""
+    force_body = False
+    if isinstance(body, dict):
+        try:
+            force_body = bool(body.get("force"))
+        except Exception:
+            force_body = False
+
+    force_final = bool(force) or bool(force_body)
+
     try:
-        return await _execute_run(force=force)
+        return await _execute_run(force=force_final, run_mode="manual")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Executor error: {type(e).__name__}: {e}") from e
 
@@ -1402,6 +1540,6 @@ async def cron_run(token: str, force: bool = False):
     if token != EXECUTOR_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
-        return await _execute_run(force=force)
+        return await _execute_run(force=force, run_mode="cron")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Executor error: {type(e).__name__}: {e}") from e
