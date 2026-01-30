@@ -45,6 +45,7 @@ PORTFOLIO_KEY = os.getenv("PORTFOLIO_KEY", "executor:portfolio")
 HISTORY_PREFIX = os.getenv("HISTORY_PREFIX", "executor:history:")
 PRESETS_KEY = os.getenv("PRESETS_KEY", "executor:presets")
 AGENTS_PRESET_JSON = os.getenv("AGENTS_PRESET_JSON", "")
+TRADES_PREFIX = os.getenv("TRADES_PREFIX", "executor:trades:")
 
 
 # ----------------------------
@@ -553,6 +554,48 @@ async def get_history(market_id: str) -> Dict[str, Any]:
 
 
 # ----------------------------
+# Trades (ledger)
+# ----------------------------
+async def append_trade(market_id: str, trade: Dict[str, Any], limit: int = 200) -> None:
+    """Append trade to per-market ledger stored as a JSON array."""
+    key = f"{TRADES_PREFIX}{market_id}"
+    raw = await upstash_get(key)
+    items: List[Dict[str, Any]] = []
+    if raw:
+        try:
+            items = json.loads(raw) or []
+        except Exception:
+            items = []
+
+    items.append(trade)
+    if len(items) > limit:
+        items = items[-limit:]
+
+    await upstash_set(key, json.dumps(items))
+
+
+async def get_trades(market_id: str) -> Dict[str, Any]:
+    key = f"{TRADES_PREFIX}{market_id}"
+    raw = await upstash_get(key)
+    if not raw:
+        return {"ok": True, "market_id": market_id, "items": []}
+    try:
+        items = json.loads(raw) or []
+    except Exception:
+        items = []
+    return {"ok": True, "market_id": market_id, "items": items}
+
+
+async def get_all_trades(limit_per_market: int = 50) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for m in MARKETS:
+        res = await get_trades(m)
+        items = res.get("items") or []
+        out[m] = items[-limit_per_market:]
+    return {"ok": True, "items_by_market": out}
+
+
+# ----------------------------
 # App
 # ----------------------------
 app = FastAPI(title="Polyclawd Executor", version="0.1.0")
@@ -600,9 +643,22 @@ async def public_latest(market_id: str):
     return await get_latest(market_id)
 
 
+
 @app.get("/public/history/{market_id}")
 async def public_history(market_id: str):
     return await get_history(market_id)
+
+
+# Trades endpoints
+
+@app.get("/public/trades/{market_id}")
+async def public_trades(market_id: str):
+    return await get_trades(market_id)
+
+
+@app.get("/public/trades")
+async def public_trades_all(limit_per_market: int = 50):
+    return await get_all_trades(limit_per_market=limit_per_market)
 
 
 @app.get("/public/portfolio")
@@ -641,6 +697,7 @@ async def public_snapshot():
         "prices": scenario_prices,
         "realized_pnl": p.get("realized_pnl", 0),
         "equity_curve": p.get("equity_curve", []),
+        "trades": (await get_all_trades(limit_per_market=10)).get("items_by_market", {}),
         "ts": int(time.time()),
         "ts_ms": int(time.time() * 1000),
     }
@@ -654,6 +711,8 @@ async def admin_reset(_: bool = Depends(require_auth)):
     deleted.append(await upstash_del(PRESETS_KEY))
     for m in MARKETS:
         deleted.append(await upstash_del(f"{HISTORY_PREFIX}{m}"))
+    for m in MARKETS:
+        deleted.append(await upstash_del(f"{TRADES_PREFIX}{m}"))
     deleted.append(await upstash_del(LOCK_KEY))
     return {"ok": True, "deleted": deleted}
 
@@ -696,6 +755,16 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
         # tick increments (demo): based on unix time / 900 sec (15 min)
         tick = int(time.time() // 900)
         run_id = str(uuid.uuid4())
+
+        def _trade_base(mid: str) -> Dict[str, Any]:
+            return {
+                "ts": int(time.time()),
+                "ts_ms": int(time.time() * 1000),
+                "run_id": run_id,
+                "tick": tick,
+                "scenario": scenario,
+                "market_id": mid,
+            }
 
         # Prevent accidental multiple executions within the same 15-min tick
         # (use ?force=true to override for manual testing)
@@ -813,12 +882,34 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             if remaining_shares <= 1e-9:
                 del positions[mid]
                 closed_positions.append(mid)
+                await append_trade(mid, {
+                    **_trade_base(mid),
+                    "side": "SELL",
+                    "action": "CLOSE",
+                    "price": round(last_price, 6),
+                    "shares": round(shares_to_sell, 8),
+                    "proceeds_usd": round(proceeds, 6),
+                    "cost_sold_usd": round(cost_sold, 6),
+                    "pnl_usd": round(pnl, 6),
+                })
             else:
                 pos["shares"] = round(remaining_shares, 8)
                 pos["cost_basis_usd"] = round(remaining_cost, 6)
                 pos["entry_price"] = round((remaining_cost / remaining_shares) if remaining_shares > 0 else pos.get("entry_price", 0.5), 6)
                 positions[mid] = pos
                 reduced_positions.append(mid)
+                await append_trade(mid, {
+                    **_trade_base(mid),
+                    "side": "SELL",
+                    "action": "REDUCE",
+                    "price": round(last_price, 6),
+                    "shares": round(shares_to_sell, 8),
+                    "proceeds_usd": round(proceeds, 6),
+                    "cost_sold_usd": round(cost_sold, 6),
+                    "pnl_usd": round(pnl, 6),
+                    "remaining_shares": round(remaining_shares, 8),
+                    "remaining_cost_basis_usd": round(remaining_cost, 6),
+                })
 
         # 3) open/add positions where BUY, respecting caps
         pv = portfolio_value({"cash": cash, "positions": positions})
@@ -863,6 +954,14 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
 
                 cash -= qty
                 opened_positions.append(mid)  # reuse for UI: treated as "OPEN/ADD" bucket
+                await append_trade(mid, {
+                    **_trade_base(mid),
+                    "side": "BUY",
+                    "action": "ADD",
+                    "price": round(px, 6),
+                    "shares": round(add_shares, 8),
+                    "cost_usd": round(qty, 6),
+                })
                 continue
 
             # OPEN new position
@@ -890,6 +989,14 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             }
             cash -= qty
             opened_positions.append(mid)
+            await append_trade(mid, {
+                **_trade_base(mid),
+                "side": "BUY",
+                "action": "OPEN",
+                "price": round(px, 6),
+                "shares": round(shares, 8),
+                "cost_usd": round(qty, 6),
+            })
 
         # 4) save portfolio
         p["cash"] = round(cash, 2)
