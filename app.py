@@ -21,6 +21,7 @@ LOCK_KEY = os.getenv("EXECUTOR_LOCK_KEY", "executor:lock")
 LOCK_TTL_SECONDS = int(os.getenv("EXECUTOR_LOCK_TTL_SECONDS", "60"))
 
 #
+#
 # trading demo settings
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
 MAX_TRADE_FRACTION = float(os.getenv("MAX_TRADE_FRACTION", "0.10"))  # 10% of portfolio value
@@ -29,6 +30,11 @@ STARTING_CASH = float(os.getenv("STARTING_CASH", "250"))
 # Minimum holding period (in ticks) before a position can be closed
 MIN_HOLD_TICKS = int(os.getenv("MIN_HOLD_TICKS", "2"))  # minimum ticks to hold a position before allowing exit
 EMERGENCY_EXIT_CONFIDENCE = float(os.getenv("EMERGENCY_EXIT_CONFIDENCE", "0.90"))  # allow early exit if SELL confidence >= this
+# New settings for portfolio engine
+MAX_POSITION_FRACTION = float(os.getenv("MAX_POSITION_FRACTION", "0.20"))  # max 20% of portfolio value in a single position
+FULL_EXIT_CONFIDENCE = float(os.getenv("FULL_EXIT_CONFIDENCE", "0.75"))  # if SELL and avg_confidence >= this -> full close
+REDUCE_FRACTION = float(os.getenv("REDUCE_FRACTION", "0.50"))  # fraction of position to sell on non-full exit
+PRICE_VOLATILITY = float(os.getenv("PRICE_VOLATILITY", "0.06"))  # 0..1 swing amplitude per tick (demo)
 
 # demo markets
 MARKETS = os.getenv("MARKETS", "POLY:DEMO_001,POLY:DEMO_002,POLY:DEMO_003,POLY:DEMO_004,POLY:DEMO_005,POLY:DEMO_006").split(",")
@@ -198,9 +204,11 @@ async def set_scenario(s: str) -> str:
 def _portfolio_default() -> Dict[str, Any]:
     return {
         "cash": STARTING_CASH,
-        "positions": {},  # market_id -> {market_id, qty_usd, opened_ts}
+        "positions": {},  # market_id -> position
         "last_tick": None,
         "created_ts": int(time.time()),
+        "realized_pnl": 0.0,
+        "equity_curve": [],  # list of {tick, value}
     }
 
 
@@ -222,10 +230,44 @@ async def save_portfolio(p: Dict[str, Any]) -> None:
     await upstash_set(PORTFOLIO_KEY, json.dumps(p))
 
 
+
+def _clamp(x: float, lo: float = 0.01, hi: float = 0.99) -> float:
+    return max(lo, min(hi, x))
+
+
+def market_price(market_id: str, scenario: str, tick: int) -> float:
+    """Deterministic demo 'price/probability' in [0.01, 0.99].
+
+    This replaces real Polymarket prices for now. It is stable, repeatable, and scenario-tilted.
+    """
+    base_seed = _seed_int(f"BASE|{market_id}")
+    # base around 0.30..0.70 depending on market
+    base = 0.30 + (base_seed % 400) / 1000.0
+
+    t_seed = _seed_int(f"PRICE|{market_id}|{tick}")
+    # deterministic pseudo-noise in [-1, +1]
+    noise = ((t_seed % 2000) - 1000) / 1000.0
+    drift = 0.0
+    if scenario == "bull":
+        drift = 0.015
+    elif scenario == "bear":
+        drift = -0.015
+
+    px = base + drift + noise * PRICE_VOLATILITY
+    return round(_clamp(px), 4)
+
+
 def portfolio_value(p: Dict[str, Any]) -> float:
-    # demo: считаем что позиции по номиналу (без price), для MVP
-    pos_total = sum(float(v.get("qty_usd", 0)) for v in p.get("positions", {}).values())
-    return float(p.get("cash", 0)) + pos_total
+    cash = float(p.get("cash", 0) or 0)
+    pos_total = 0.0
+    for pos in (p.get("positions") or {}).values():
+        try:
+            shares = float(pos.get("shares", 0) or 0)
+            last_price = float(pos.get("last_price", pos.get("entry_price", 0)) or 0)
+            pos_total += shares * last_price
+        except Exception:
+            continue
+    return round(cash + pos_total, 6)
 
 
 # ----------------------------
@@ -533,6 +575,10 @@ async def healthz():
         "max_trade_fraction": MAX_TRADE_FRACTION,
         "min_hold_ticks": MIN_HOLD_TICKS,
         "emergency_exit_confidence": EMERGENCY_EXIT_CONFIDENCE,
+        "max_position_fraction": MAX_POSITION_FRACTION,
+        "full_exit_confidence": FULL_EXIT_CONFIDENCE,
+        "reduce_fraction": REDUCE_FRACTION,
+        "price_volatility": PRICE_VOLATILITY,
     }
 
 
@@ -583,6 +629,8 @@ async def public_snapshot():
     for m in MARKETS:
         latest_by_market[m] = await get_latest(m)
 
+    scenario_prices: Dict[str, float] = {m: market_price(m, scenario, int(time.time() // 900)) for m in MARKETS}
+
     return {
         "ok": True,
         "scenario": scenario,
@@ -590,6 +638,9 @@ async def public_snapshot():
         "portfolio": p,
         "value": portfolio_value(p),
         "latest": latest_by_market,
+        "prices": scenario_prices,
+        "realized_pnl": p.get("realized_pnl", 0),
+        "equity_curve": p.get("equity_curve", []),
         "ts": int(time.time()),
         "ts_ms": int(time.time() * 1000),
     }
@@ -667,6 +718,9 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
         for market_id in MARKETS:
             analyses.append(run_agents_for_market(market_id, scenario, tick, presets=presets))
 
+        # deterministic demo prices for this tick
+        prices: Dict[str, float] = {m: market_price(m, scenario, tick) for m in MARKETS}
+
         # 2) close positions where SELL or confidence drops
         positions: Dict[str, Any] = p.get("positions", {}) or {}
         positions_before: Dict[str, Any] = dict(positions)
@@ -675,6 +729,7 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
         closed_positions: List[str] = []
         opened_positions: List[str] = []
         open_skip_reason: Dict[str, str] = {}
+        reduced_positions: List[str] = []
 
         # map market -> analysis for quick access
         analysis_by_market = {a["market_id"]: a for a in analyses}
@@ -684,43 +739,91 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             if not a:
                 continue
 
-            decision = a["summary"].get("decision")
+            decision = str(a["summary"].get("decision", "HOLD")).upper()
             avg_conf = float(a["summary"].get("avg_confidence", 0))
 
             pos = positions.get(mid) or {}
+            # Backward compat: migrate old positions (qty_usd -> shares/cost_basis)
+            last_price = float(prices.get(mid) or 0)
+            if "shares" not in pos or "cost_basis_usd" not in pos or "entry_price" not in pos:
+                qty_usd = float(pos.get("qty_usd", 0) or 0)
+                entry_price = float(pos.get("entry_price") or last_price or 0.5)
+                entry_price = _clamp(entry_price)
+                shares = qty_usd / entry_price if entry_price > 0 else 0.0
+                pos["shares"] = round(shares, 8)
+                pos["cost_basis_usd"] = round(qty_usd, 6)
+                pos["entry_price"] = round(entry_price, 6)
+                pos["last_price"] = round(last_price, 6)
+                positions[mid] = pos
+
+            # update mark price
+            pos["last_price"] = round(last_price, 6)
+
             opened_tick = pos.get("opened_tick")
             if opened_tick is None:
-                # Backward-compat: infer from opened_ts if present
                 try:
                     opened_ts = int(pos.get("opened_ts") or 0)
                 except Exception:
                     opened_ts = 0
                 opened_tick = int(opened_ts // 900) if opened_ts else tick
+                pos["opened_tick"] = opened_tick
 
             age_ticks = max(0, int(tick) - int(opened_tick))
             too_young_to_exit = age_ticks < MIN_HOLD_TICKS
             emergency_exit = (decision == "SELL") and (avg_conf >= EMERGENCY_EXIT_CONFIDENCE)
 
             wants_exit = (decision == "SELL") or (avg_conf <= EXIT_CONFIDENCE_THRESHOLD)
+            if not wants_exit:
+                continue
 
-            if wants_exit and too_young_to_exit and not emergency_exit:
-                # Block early exits to reduce churn
-                # (we'll surface this via execution.reason)
-                pass
-            elif decision == "SELL":
-                qty = float(pos.get("qty_usd", 0))
-                cash += qty
+            if too_young_to_exit and not emergency_exit:
+                # blocked by min-hold (surfaced in execution)
+                continue
+
+            # determine full close vs reduce
+            full_close = bool((decision == "SELL" and avg_conf >= FULL_EXIT_CONFIDENCE) or (avg_conf <= EXIT_CONFIDENCE_THRESHOLD))
+            if full_close:
+                sell_fraction = 1.0
+            else:
+                sell_fraction = float(REDUCE_FRACTION)
+                sell_fraction = max(0.0, min(1.0, sell_fraction))
+
+            shares = float(pos.get("shares", 0) or 0)
+            if shares <= 0:
+                # invalid position, remove
                 del positions[mid]
                 closed_positions.append(mid)
-            elif avg_conf <= EXIT_CONFIDENCE_THRESHOLD:
-                qty = float(pos.get("qty_usd", 0))
-                cash += qty
+                continue
+
+            shares_to_sell = shares * sell_fraction
+            shares_to_sell = min(shares, shares_to_sell)
+
+            # proceeds and cost basis (proportional)
+            proceeds = shares_to_sell * last_price
+            cost_basis = float(pos.get("cost_basis_usd", 0) or 0)
+            cost_sold = cost_basis * (shares_to_sell / shares) if shares > 0 else 0.0
+            pnl = proceeds - cost_sold
+
+            cash += proceeds
+            p["realized_pnl"] = round(float(p.get("realized_pnl", 0) or 0) + pnl, 6)
+
+            # update remaining position
+            remaining_shares = shares - shares_to_sell
+            remaining_cost = cost_basis - cost_sold
+            if remaining_shares <= 1e-9:
                 del positions[mid]
                 closed_positions.append(mid)
+            else:
+                pos["shares"] = round(remaining_shares, 8)
+                pos["cost_basis_usd"] = round(remaining_cost, 6)
+                pos["entry_price"] = round((remaining_cost / remaining_shares) if remaining_shares > 0 else pos.get("entry_price", 0.5), 6)
+                positions[mid] = pos
+                reduced_positions.append(mid)
 
-        # 3) open positions where BUY (but max 6)
-        pv = cash + sum(float(v.get("qty_usd", 0)) for v in positions.values())
+        # 3) open/add positions where BUY, respecting caps
+        pv = portfolio_value({"cash": cash, "positions": positions})
         max_trade = pv * MAX_TRADE_FRACTION
+        max_pos_value = pv * MAX_POSITION_FRACTION
 
         # candidates BUY sorted by confidence
         buy_candidates: List[Tuple[str, float]] = []
@@ -730,22 +833,58 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
         buy_candidates.sort(key=lambda x: x[1], reverse=True)
 
         for mid, _conf in buy_candidates:
+            px = float(prices.get(mid) or 0.5)
+            px = _clamp(px)
+
+            # compute current position value if exists
             if mid in positions:
-                open_skip_reason[mid] = "already in position"
+                pos = positions.get(mid) or {}
+                shares = float(pos.get("shares", 0) or 0)
+                cur_value = shares * float(pos.get("last_price", px) or px)
+                # ADD (scale-in) only if under per-position cap
+                room = max(0.0, max_pos_value - cur_value)
+                if room <= 1e-6:
+                    open_skip_reason[mid] = f"max position cap reached ({MAX_POSITION_FRACTION:.2f})"
+                    continue
+                if cash <= 0:
+                    open_skip_reason[mid] = "insufficient cash"
+                    continue
+                qty = min(max_trade, cash, room)
+                if qty <= 0:
+                    open_skip_reason[mid] = "trade size <= 0"
+                    continue
+
+                add_shares = qty / px
+                pos["shares"] = round(float(pos.get("shares", 0) or 0) + add_shares, 8)
+                pos["cost_basis_usd"] = round(float(pos.get("cost_basis_usd", 0) or 0) + qty, 6)
+                pos["entry_price"] = round(float(pos["cost_basis_usd"]) / float(pos["shares"]) if float(pos["shares"]) > 0 else px, 6)
+                pos["last_price"] = round(px, 6)
+                positions[mid] = pos
+
+                cash -= qty
+                opened_positions.append(mid)  # reuse for UI: treated as "OPEN/ADD" bucket
                 continue
+
+            # OPEN new position
             if len(positions) >= MAX_OPEN_POSITIONS:
                 open_skip_reason[mid] = f"max open positions reached ({MAX_OPEN_POSITIONS})"
                 break
             if cash <= 0:
                 open_skip_reason[mid] = "insufficient cash"
                 break
-            qty = min(max_trade, cash)
+
+            qty = min(max_trade, cash, max_pos_value)
             if qty <= 0:
                 open_skip_reason[mid] = "trade size <= 0"
                 break
+
+            shares = qty / px
             positions[mid] = {
                 "market_id": mid,
-                "qty_usd": round(qty, 2),
+                "shares": round(shares, 8),
+                "cost_basis_usd": round(qty, 6),
+                "entry_price": round(px, 6),
+                "last_price": round(px, 6),
                 "opened_ts": int(time.time()),
                 "opened_tick": tick,
             }
@@ -756,6 +895,15 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
         p["cash"] = round(cash, 2)
         p["positions"] = positions
         p["last_tick"] = tick
+        await save_portfolio(p)
+
+        # append equity curve point
+        eq = float(portfolio_value(p))
+        curve = list(p.get("equity_curve") or [])
+        curve.append({"tick": tick, "value": round(eq, 6)})
+        if len(curve) > 96:
+            curve = curve[-96:]
+        p["equity_curve"] = curve
         await save_portfolio(p)
 
         positions_after: Dict[str, Any] = p.get("positions", {}) or {}
@@ -814,17 +962,17 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             if mid in closed_positions:
                 action = "CLOSE"
                 reason = "closed due to SELL" if decision == "SELL" else "closed due to low confidence"
+            elif mid in reduced_positions:
+                action = "REDUCE"
+                reason = "reduced position (partial exit)"
             elif mid in opened_positions:
-                action = "OPEN"
-                reason = "opened due to BUY"
+                action = "OPEN" if not was_in_position else "ADD"
+                reason = "opened due to BUY" if not was_in_position else "added to position due to BUY"
             else:
                 # No portfolio change on this market
                 if exit_blocked:
                     action = "NONE"
                     reason = f"exit blocked: position too young (min_hold_ticks={MIN_HOLD_TICKS})"
-                elif intent == "ADD" and is_in_position:
-                    action = "NONE"
-                    reason = "scaling not implemented (ADD disabled)"
                 elif intent == "OPEN" and not is_in_position:
                     action = "NONE"
                     reason = open_skip_reason.get(mid, "not opened")
@@ -843,6 +991,25 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
                     else:
                         reason = "no action"
 
+            px = float(prices.get(mid) or 0)
+            pos_snap = None
+            if is_in_position:
+                pos = positions_after.get(mid) or {}
+                shares = float(pos.get("shares", 0) or 0)
+                entry = float(pos.get("entry_price", 0) or 0)
+                lastp = float(pos.get("last_price", px) or px)
+                value = round(shares * lastp, 6)
+                cost = float(pos.get("cost_basis_usd", 0) or 0)
+                unreal = round(value - cost, 6)
+                pos_snap = {
+                    "shares": round(shares, 8),
+                    "entry_price": round(entry, 6),
+                    "last_price": round(lastp, 6),
+                    "value": value,
+                    "cost_basis_usd": round(cost, 6),
+                    "unrealized_pnl": unreal,
+                }
+
             return {
                 "in_position": is_in_position,
                 "was_in_position": was_in_position,
@@ -854,6 +1021,8 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
                 "age_ticks": age_ticks,
                 "age_minutes": age_minutes,
                 "exit_blocked": exit_blocked,
+                "price": px,
+                "position": pos_snap,
             }
 
         # 5) write histories (per market)
@@ -869,11 +1038,14 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
                 "summary": a["summary"],
                 "digest": a["digest"],
                 "execution": _execution_for_market(mid, a),
+                "price": prices.get(mid),
                 "portfolio": {
                     "value": round(portfolio_value(p), 2),
                     "cash": p["cash"],
                     "open_positions": len(p["positions"]),
                     "positions": list(p["positions"].keys()),
+                    "realized_pnl": p.get("realized_pnl", 0),
+                    "equity": portfolio_value(p),
                 },
                 "agents": a["agents"],
             }
