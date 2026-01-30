@@ -1448,6 +1448,11 @@ async def _execute_run(force: bool = False) -> Dict[str, Any]:
             "duration_sec": duration,
             "tick_mode": mode,
         }
+    finally:
+        try:
+            await unlock(lock_id)
+        except Exception:
+            pass
 
 
 # ---- Tick mode admin endpoint ----
@@ -1483,12 +1488,6 @@ async def admin_tick(body: Dict[str, Any], _: bool = Depends(require_auth)):
 
     out["current_tick"] = await current_tick()
     return out
-
-    finally:
-        try:
-            await unlock(lock_id)
-        except Exception:
-            pass
 
 
 @app.post("/run")
